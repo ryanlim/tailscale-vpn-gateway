@@ -8,13 +8,13 @@ FROM tailscale/tailscale:latest
 # stalled through the VPN tunnel.
 RUN apk add --no-cache \
     bash \
-    python3 \ 
+    python3 \
     openssl \
     mtr \
     curl \
+    kmod \
     prometheus-node-exporter \
     nginx \
-    openssl \
  && rm -f /etc/nginx/http.d/default.conf
 
 COPY tailscale_up.sh /tailscale_up.sh

@@ -20,6 +20,7 @@ services:
       - 8.8.8.8
     volumes:
       - "/dev/net/tun:/dev/net/tun"
+      - "/lib/modules:/lib/modules:ro"
       - "./tailscale/state:/var/lib/tailscale"
       - "./tailscale/scripts:/scripts"
       - "./tailscale/cert:/etc/nginx/cert:ro"
@@ -137,10 +138,12 @@ services:
   # ProtonVPN via WireGuard — supports IPv6 exit (AllowedIPs = ::/0).
   # Prerequisites:
   #   1. Put WireGuard config(s) in ./protonvpn/wireguard/ (download from protonvpn.com → WireGuard)
-  #   2. Add to .env: IP_PROTONVPN, IP_VPN_V6, IP_SUBNET_V6
+  #   2. Add to .env: IP_PROTONVPN, IP_SUBNET_V6
   #   3. Add a "protonvpn-*" entry to control-panel/config/backends.json (see backends.json.example)
   #   4. Run: docker compose up -d --build protonvpn
   #   5. Switch traffic to it via the control panel "Set as Active" button
+  # Note: entrypoint.sh loads ip6table_filter + ip6table_nat via modprobe using
+  # the /lib/modules bind-mount and the sys_module cap (both set below).
   protonvpn:
     build:
       context: protonvpn
@@ -159,6 +162,7 @@ services:
       - WG_CONF=/etc/wireguard/free-us-8.conf
     volumes:
       - "/dev/net/tun:/dev/net/tun"
+      - "/lib/modules:/lib/modules:ro"
       - "./protonvpn/wireguard:/etc/wireguard"
     cap_add:
       - net_admin

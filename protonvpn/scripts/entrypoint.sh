@@ -8,6 +8,11 @@ EGRESS_CHECK_INTERVAL=${EGRESS_CHECK_INTERVAL:-60}
 EGRESS_CHECK_TIMEOUT=${EGRESS_CHECK_TIMEOUT:-8}
 UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
 
+# Load legacy ip6tables modules so ip6tables NAT works in-container.
+# The host kernel may use nftables and not load these automatically.
+# Requires sys_module cap + /lib/modules bind-mount (set in compose).
+modprobe ip6table_filter ip6table_nat 2>/dev/null || true
+
 # Tear down any stale interface from a previous run.
 wg-quick down "$WG_IFACE" 2>/dev/null || true
 

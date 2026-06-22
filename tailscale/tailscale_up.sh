@@ -12,6 +12,12 @@ if [ -d /scripts ]; then
   done
 fi
 
+# Load legacy ip6tables kernel modules so Tailscale can set up its IPv6
+# exit-node netfilter chains (ts-forward / ts-postrouting for ip6tables).
+# The host kernel may not have these loaded by default when it uses nftables
+# for its own rules. Requires sys_module cap + /lib/modules bind-mount.
+modprobe ip6table_filter ip6table_nat 2>/dev/null || true
+
 tailscaled &
 
 # Wait for the daemon's localapi to actually answer before issuing CLI
