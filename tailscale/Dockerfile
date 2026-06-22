@@ -18,4 +18,5 @@ RUN apk add --no-cache \
  && rm -f /etc/nginx/http.d/default.conf
 
 COPY tailscale_up.sh /tailscale_up.sh
+COPY gateway_api.py /gateway_api.py
 RUN chmod +x /tailscale_up.sh

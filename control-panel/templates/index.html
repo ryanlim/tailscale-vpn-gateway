@@ -41,7 +41,10 @@
 
             <!-- Backend selector -->
             <label for="backendSelect" class="form-label text-muted small mb-1">Backend</label>
-            <select class="form-select mb-3" id="backendSelect"></select>
+            <div class="d-flex gap-2 mb-3">
+                <select class="form-select" id="backendSelect"></select>
+                <button class="btn btn-outline-primary btn-sm text-nowrap" id="setActiveBtn" style="min-width:7rem">Set as Active</button>
+            </div>
 
             <!-- Status badge -->
             <div class="alert alert-secondary d-flex justify-content-center align-items-center fw-semibold mb-3 position-relative" id="statusBox" role="status">
@@ -73,6 +76,7 @@
     const PANEL_BASE   = window.location.pathname.replace(/\/?$/, '') + '/api/v1/';
     const STORAGE_KEY  = 'vpn-panel-backend';
     let   currentBackend = null;
+    let   activeBackend  = null;  // backend currently routing traffic
     let   lastStatus = null;  // most recent /status response, drives connect-button state
     let   pollTimer = null;
 
@@ -80,6 +84,50 @@
         // suffix is e.g. 'status', 'connect', 'status?refresh=1'
         if (!currentBackend) return null;
         return `${PANEL_BASE}backends/${encodeURIComponent(currentBackend)}/${suffix}`;
+    }
+
+    function updateActiveBtn() {
+        const btn = document.getElementById('setActiveBtn');
+        if (!currentBackend) { btn.disabled = true; return; }
+        if (currentBackend === activeBackend) {
+            btn.textContent = 'Routing traffic';
+            btn.className = 'btn btn-success btn-sm text-nowrap';
+            btn.disabled = true;
+        } else {
+            btn.textContent = 'Set as Active';
+            btn.className = 'btn btn-outline-primary btn-sm text-nowrap';
+            btn.disabled = false;
+        }
+    }
+
+    function loadActiveBackend() {
+        return fetch(PANEL_BASE + 'active-backend')
+            .then(r => r.json())
+            .then(data => {
+                activeBackend = data.name || null;
+                updateActiveBtn();
+            })
+            .catch(() => {});
+    }
+
+    function setActiveBackend() {
+        if (!currentBackend) return;
+        fetch(PANEL_BASE + 'active-backend', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: currentBackend}),
+        })
+        .then(r => r.json().then(d => ({ok: r.ok, d})))
+        .then(({ok, d}) => {
+            if (ok) {
+                activeBackend = currentBackend;
+                updateActiveBtn();
+                showToast('Traffic now routing through ' + currentBackend);
+            } else {
+                showToast('Error: ' + (d.error || 'Unknown error'), true);
+            }
+        })
+        .catch(err => showToast('Error: ' + err.message, true));
     }
 
     function showToast(message, isError = false) {
@@ -281,6 +329,7 @@
         setServerSelectPlaceholder('Loading server list…');
         document.getElementById('statusText').textContent = 'Status: …';
         updateConnectButton();
+        updateActiveBtn();
         updateStatus();
         loadServers();
     }
@@ -314,7 +363,8 @@
         document.getElementById('refreshBtn').addEventListener('click', () => updateStatus(true));
         document.getElementById('backendSelect').addEventListener('change', e => selectBackend(e.target.value));
         document.getElementById('serverSelect').addEventListener('change', updateConnectButton);
-        loadBackends();
+        document.getElementById('setActiveBtn').addEventListener('click', setActiveBackend);
+        loadBackends().then(loadActiveBackend);
         pollTimer = setInterval(updateStatus, 10000);
     });
 </script>

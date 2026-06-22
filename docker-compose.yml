@@ -142,6 +142,8 @@ services:
     restart: always
     volumes:
       - "./control-panel/config:/config:ro"
+    environment:
+      - TAILSCALE_GATEWAY_URL=http://ts-tailscale-${INSTANCE_NAME}:8080
     networks:
       ts-net:
         ipv4_address: ${IP_PANEL}

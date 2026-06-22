@@ -26,8 +26,12 @@ while [ $i -lt 60 ]; do
 done
 ps auxwwf
 
+ACTIVE_GW_FILE="/tmp/active_gateway"
+echo "$IP_NORDVPN" > "$ACTIVE_GW_FILE"
 ip route del default
 ip route add default via $IP_NORDVPN dev eth0
+
+nohup python3 /gateway_api.py >/tmp/gateway_api.log 2>&1 &
 
 INSTANCE_NAME_=$(echo $INSTANCE_NAME | sed 's/_/-/g')
 
@@ -61,10 +65,13 @@ do_tailscale_up() {
 }
 
 is_vpn_connected() {
-  # Hit the VPN backend's status API. Empty/unreachable response counts as
-  # "not connected" so we err on the side of NOT kicking tailscale when the
-  # backend itself is down (captive portal, upstream outage, mid-reconnect).
-  curl -fsS --max-time 5 "http://${IP_NORDVPN}/api/v1/status" 2>/dev/null \
+  # Hit the active VPN backend's status API. Reading the state file rather
+  # than $IP_NORDVPN means a runtime gateway switch is reflected immediately.
+  # Empty/unreachable response counts as "not connected" so we err on the
+  # side of NOT kicking tailscale when the backend is down or mid-reconnect.
+  local gw
+  gw=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
+  curl -fsS --max-time 5 "http://${gw}/api/v1/status" 2>/dev/null \
     | grep -q '"status": *"Connected"'
 }
 
@@ -166,9 +173,11 @@ while [ 1 ]; do
 
   pidof tailscaled >/dev/null || tailscaled &
 
-  # Re-assert the default route in case it went missing.
-  ip route show default | grep -q "via $IP_NORDVPN" \
-    || ip route replace default via $IP_NORDVPN dev eth0
+  # Re-assert the default route in case it went missing. Read the state file
+  # so a runtime gateway switch (via gateway_api.py) is honoured here too.
+  ACTIVE_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
+  ip route show default | grep -q "via $ACTIVE_GW" \
+    || ip route replace default via "$ACTIVE_GW" dev eth0
 
   # Safeguard: only evaluate tailscale's health when the VPN backend itself
   # reports Connected. If the VPN is down, unreachable, or mid-reconnect,
