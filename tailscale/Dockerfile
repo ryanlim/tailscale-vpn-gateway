@@ -13,6 +13,7 @@ RUN apk add --no-cache \
     mtr \
     curl \
     kmod \
+    conntrack-tools \
     prometheus-node-exporter \
     nginx \
  && rm -f /etc/nginx/http.d/default.conf

@@ -76,6 +76,10 @@ def _switch(host, ip=None, ip6=None, ipv6=False):
         except OSError:
             pass
 
+    # Flush conntrack so existing connections re-establish through the new
+    # route immediately rather than persisting through the old backend.
+    subprocess.run(["conntrack", "-F"], capture_output=True)
+
     return ip
 
 

@@ -9,6 +9,8 @@ import json
 import logging
 import os
 import socket
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -23,6 +25,28 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(os.environ.get("BACKENDS_CONFIG", "/config/backends.json"))
 TAILSCALE_GATEWAY_URL = os.environ.get("TAILSCALE_GATEWAY_URL", "").rstrip("/")
+
+# Persistent HTTP session to the gateway API — reuses the TCP connection
+# across calls so there's no handshake overhead on every switch or poll.
+_gw_session = requests.Session()
+
+# DNS cache: Docker's resolver (127.0.0.11) is fast but resolving on every
+# active-backend poll adds up. Container IPs are stable; 30s TTL is safe.
+_dns_cache: dict = {}
+_dns_lock = threading.Lock()
+_DNS_TTL = 30  # seconds
+
+
+def _resolve_cached(host: str, family: int) -> str:
+    key = (host, family)
+    with _dns_lock:
+        entry = _dns_cache.get(key)
+        if entry and time.monotonic() - entry[0] < _DNS_TTL:
+            return entry[1]
+    addr = socket.getaddrinfo(host, None, family)[0][4][0]
+    with _dns_lock:
+        _dns_cache[key] = (time.monotonic(), addr)
+    return addr
 PROXY_TIMEOUT = 30  # seconds; status polls etc. should be well under this
 # Hop-by-hop headers per RFC 7230 §6.1 — never forward these on either leg.
 HOP_BY_HOP = {
@@ -88,7 +112,7 @@ def get_active_backend():
     if not TAILSCALE_GATEWAY_URL:
         return jsonify({"error": "TAILSCALE_GATEWAY_URL not configured"}), 503
     try:
-        resp = requests.get(f"{TAILSCALE_GATEWAY_URL}/active", timeout=5)
+        resp = _gw_session.get(f"{TAILSCALE_GATEWAY_URL}/active", timeout=5)
         active_ip = resp.json().get("ip", "")
     except requests.RequestException as exc:
         return jsonify({"error": f"gateway unreachable: {exc}"}), 502
@@ -98,7 +122,7 @@ def get_active_backend():
         if not host:
             continue
         try:
-            resolved = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+            resolved = _resolve_cached(host, socket.AF_INET)
         except OSError:
             continue
         if resolved == active_ip:
@@ -127,20 +151,20 @@ def set_active_backend():
     # Docker container names. The control panel uses Docker's embedded resolver
     # (127.0.0.11) so it can.
     try:
-        ip = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+        ip = _resolve_cached(host, socket.AF_INET)
     except socket.gaierror as exc:
         return jsonify({"error": f"Cannot resolve {host}: {exc}"}), 502
 
     ip6 = None
     if ipv6:
         try:
-            ip6 = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
+            ip6 = _resolve_cached(host, socket.AF_INET6)
         except socket.gaierror:
             ip6 = None
             ipv6 = False
 
     try:
-        resp = requests.post(
+        resp = _gw_session.post(
             f"{TAILSCALE_GATEWAY_URL}/switch",
             json={"host": host, "ip": ip, "ip6": ip6, "ipv6": ipv6},
             timeout=10,
