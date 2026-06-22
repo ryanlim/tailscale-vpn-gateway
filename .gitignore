@@ -6,3 +6,5 @@
 /control-panel/config/backends.json
 __pycache__/
 *.pyc
+/nordvpn-wg/wireguard/
+/protonvpn/wireguard/

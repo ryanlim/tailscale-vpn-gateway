@@ -141,32 +141,31 @@ services:
   #   3. Add a "protonvpn-*" entry to control-panel/config/backends.json (see backends.json.example)
   #   4. Run: docker compose up -d --build protonvpn
   #   5. Switch traffic to it via the control panel "Set as Active" button
-  # protonvpn:
-  #   build:
-  #     context: protonvpn
-  #   container_name: ts-protonvpn-${INSTANCE_NAME}
-  #   hostname: ts-protonvpn
-  #   restart: always
-  #   dns:
-  #     - 1.1.1.1
-  #     - 8.8.8.8
-  #   sysctls:
-  #     - net.ipv4.ip_forward=1
-  #     - net.ipv4.conf.all.forwarding=1
-  #     - net.ipv6.conf.all.forwarding=1
-  #   environment:
-  #     - INSTANCE_NAME=${INSTANCE_NAME}
-  #     - WG_CONF=/etc/wireguard/free-us-8.conf
-  #   volumes:
-  #     - "/dev/net/tun:/dev/net/tun"
-  #     - "./protonvpn/wireguard:/etc/wireguard"
-  #   cap_add:
-  #     - net_admin
-  #     - sys_module
-  #   networks:
-  #     ts-net:
-  #       ipv4_address: ${IP_PROTONVPN}
-  #       ipv6_address: ${IP_VPN_V6}
+  protonvpn:
+    build:
+      context: protonvpn
+    container_name: ts-protonvpn-${INSTANCE_NAME}
+    hostname: ts-protonvpn
+    restart: always
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.forwarding=1
+      - net.ipv6.conf.all.forwarding=1
+    environment:
+      - INSTANCE_NAME=${INSTANCE_NAME}
+      - WG_CONF=/etc/wireguard/free-us-8.conf
+    volumes:
+      - "/dev/net/tun:/dev/net/tun"
+      - "./protonvpn/wireguard:/etc/wireguard"
+    cap_add:
+      - net_admin
+      - sys_module
+    networks:
+      ts-net:
+        ipv4_address: ${IP_PROTONVPN}
 
   control-panel:
     build:
