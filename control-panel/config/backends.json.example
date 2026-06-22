@@ -3,7 +3,14 @@
     {
       "name": "wg-us",
       "label": "NordVPN-WG (US)",
-      "url": "http://ts-nordvpn-vpn-generic-wg:80"
+      "url": "http://ts-nordvpn-<INSTANCE_NAME>:80",
+      "ipv6": false
+    },
+    {
+      "name": "protonvpn-free-us",
+      "label": "ProtonVPN (US Free #8)",
+      "url": "http://ts-protonvpn-<INSTANCE_NAME>:80",
+      "ipv6": true
     }
   ]
 }

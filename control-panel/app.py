@@ -120,10 +120,11 @@ def set_active_backend():
     host = backend_host(backend)
     if not host:
         return jsonify({"error": f"Backend '{name}' has no resolvable host in its url"}), 400
+    ipv6 = bool(backend.get("ipv6", False))
     try:
         resp = requests.post(
             f"{TAILSCALE_GATEWAY_URL}/switch",
-            json={"host": host},
+            json={"host": host, "ipv6": ipv6},
             timeout=10,
         )
         if not resp.ok:

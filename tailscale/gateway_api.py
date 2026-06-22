@@ -6,11 +6,16 @@ GET  /active                               — returns the current active gatewa
 """
 import http.server
 import json
+import logging
 import os
 import socket
 import subprocess
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 GATEWAY_STATE = "/tmp/active_gateway"
+GATEWAY_STATE_V6 = "/tmp/active_gateway_v6"
 
 
 def _active_ip():
@@ -20,18 +25,46 @@ def _active_ip():
         return ""
 
 
-def _resolve(hostname):
-    return socket.getaddrinfo(hostname, None, socket.AF_INET)[0][4][0]
+def _active_ip_v6():
+    try:
+        return open(GATEWAY_STATE_V6).read().strip()
+    except OSError:
+        return ""
 
 
-def _switch(host):
-    ip = _resolve(host)
+def _resolve(hostname, family=socket.AF_INET):
+    return socket.getaddrinfo(hostname, None, family)[0][4][0]
+
+
+def _switch(host, ipv6=False):
+    ip = _resolve(host, socket.AF_INET)
     subprocess.run(
         ["ip", "route", "replace", "default", "via", ip, "dev", "eth0"],
         check=True,
     )
     with open(GATEWAY_STATE, "w") as f:
         f.write(ip)
+
+    if ipv6:
+        try:
+            ip6 = _resolve(host, socket.AF_INET6)
+            subprocess.run(
+                ["ip", "-6", "route", "replace", "default", "via", ip6, "dev", "eth0"],
+                check=True,
+            )
+            with open(GATEWAY_STATE_V6, "w") as f:
+                f.write(ip6)
+        except (socket.gaierror, subprocess.CalledProcessError) as exc:
+            logger.warning("IPv6 route setup failed for %s: %s", host, exc)
+            ipv6 = False
+
+    if not ipv6:
+        subprocess.run(["ip", "-6", "route", "del", "default"], capture_output=True)
+        try:
+            os.remove(GATEWAY_STATE_V6)
+        except OSError:
+            pass
+
     return ip
 
 
@@ -49,7 +82,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/active":
-            self._send_json(200, {"ip": _active_ip()})
+            self._send_json(200, {"ip": _active_ip(), "ip6": _active_ip_v6()})
         else:
             self._send_json(404, {"error": "not found"})
 
@@ -63,7 +96,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             host = body["host"]
             if not host or "/" in host:
                 raise ValueError(f"invalid host: {host!r}")
-            ip = _switch(host)
+            ipv6 = bool(body.get("ipv6", False))
+            ip = _switch(host, ipv6=ipv6)
             self._send_json(200, {"ok": True, "host": host, "ip": ip})
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})

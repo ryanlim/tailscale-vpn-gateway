@@ -27,6 +27,7 @@ done
 ps auxwwf
 
 ACTIVE_GW_FILE="/tmp/active_gateway"
+ACTIVE_GW_FILE_V6="/tmp/active_gateway_v6"
 echo "$IP_NORDVPN" > "$ACTIVE_GW_FILE"
 ip route del default
 ip route add default via $IP_NORDVPN dev eth0
@@ -178,6 +179,13 @@ while [ 1 ]; do
   ACTIVE_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
   ip route show default | grep -q "via $ACTIVE_GW" \
     || ip route replace default via "$ACTIVE_GW" dev eth0
+
+  # Re-assert IPv6 default route if one was established via the gateway API.
+  if [ -f "$ACTIVE_GW_FILE_V6" ]; then
+    ACTIVE_GW_V6=$(cat "$ACTIVE_GW_FILE_V6")
+    ip -6 route show default | grep -q "via $ACTIVE_GW_V6" \
+      || ip -6 route replace default via "$ACTIVE_GW_V6" dev eth0 2>/dev/null || true
+  fi
 
   # Safeguard: only evaluate tailscale's health when the VPN backend itself
   # reports Connected. If the VPN is down, unreachable, or mid-reconnect,
