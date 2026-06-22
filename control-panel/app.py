@@ -8,6 +8,7 @@ v1 contract documented in BACKEND_API.md.
 import json
 import logging
 import os
+import socket
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -97,7 +98,6 @@ def get_active_backend():
         if not host:
             continue
         try:
-            import socket
             resolved = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
         except OSError:
             continue
@@ -121,10 +121,28 @@ def set_active_backend():
     if not host:
         return jsonify({"error": f"Backend '{name}' has no resolvable host in its url"}), 400
     ipv6 = bool(backend.get("ipv6", False))
+
+    # Resolve here — the gateway API runs inside the tailscale container whose
+    # DNS is overwritten by Tailscale (100.100.100.100) and cannot resolve
+    # Docker container names. The control panel uses Docker's embedded resolver
+    # (127.0.0.11) so it can.
+    try:
+        ip = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+    except socket.gaierror as exc:
+        return jsonify({"error": f"Cannot resolve {host}: {exc}"}), 502
+
+    ip6 = None
+    if ipv6:
+        try:
+            ip6 = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
+        except socket.gaierror:
+            ip6 = None
+            ipv6 = False
+
     try:
         resp = requests.post(
             f"{TAILSCALE_GATEWAY_URL}/switch",
-            json={"host": host, "ipv6": ipv6},
+            json={"host": host, "ip": ip, "ip6": ip6, "ipv6": ipv6},
             timeout=10,
         )
         if not resp.ok:

@@ -36,8 +36,12 @@ def _resolve(hostname, family=socket.AF_INET):
     return socket.getaddrinfo(hostname, None, family)[0][4][0]
 
 
-def _switch(host, ipv6=False):
-    ip = _resolve(host, socket.AF_INET)
+def _switch(host, ip=None, ip6=None, ipv6=False):
+    # Accept pre-resolved IPs from the caller (control panel has Docker's
+    # embedded resolver; the tailscale container's DNS is replaced by Tailscale
+    # and cannot resolve Docker container names).
+    if not ip:
+        ip = _resolve(host, socket.AF_INET)
     subprocess.run(
         ["ip", "route", "replace", "default", "via", ip, "dev", "eth0"],
         check=True,
@@ -46,17 +50,24 @@ def _switch(host, ipv6=False):
         f.write(ip)
 
     if ipv6:
-        try:
-            ip6 = _resolve(host, socket.AF_INET6)
-            subprocess.run(
-                ["ip", "-6", "route", "replace", "default", "via", ip6, "dev", "eth0"],
-                check=True,
-            )
-            with open(GATEWAY_STATE_V6, "w") as f:
-                f.write(ip6)
-        except (socket.gaierror, subprocess.CalledProcessError) as exc:
-            logger.warning("IPv6 route setup failed for %s: %s", host, exc)
-            ipv6 = False
+        if not ip6:
+            try:
+                ip6 = _resolve(host, socket.AF_INET6)
+            except socket.gaierror as exc:
+                logger.warning("IPv6 DNS failed for %s: %s", host, exc)
+                ipv6 = False
+
+        if ip6:
+            try:
+                subprocess.run(
+                    ["ip", "-6", "route", "replace", "default", "via", ip6, "dev", "eth0"],
+                    check=True,
+                )
+                with open(GATEWAY_STATE_V6, "w") as f:
+                    f.write(ip6)
+            except subprocess.CalledProcessError as exc:
+                logger.warning("IPv6 route setup failed for %s: %s", host, exc)
+                ipv6 = False
 
     if not ipv6:
         subprocess.run(["ip", "-6", "route", "del", "default"], capture_output=True)
@@ -97,7 +108,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not host or "/" in host:
                 raise ValueError(f"invalid host: {host!r}")
             ipv6 = bool(body.get("ipv6", False))
-            ip = _switch(host, ipv6=ipv6)
+            ip = _switch(host, ip=body.get("ip"), ip6=body.get("ip6"), ipv6=ipv6)
             self._send_json(200, {"ok": True, "host": host, "ip": ip})
         except (KeyError, ValueError, json.JSONDecodeError) as exc:
             self._send_json(400, {"error": str(exc)})
