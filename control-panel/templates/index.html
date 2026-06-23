@@ -88,6 +88,7 @@
     let   _actionInFlight = false;
     let   _userChangedServer = false;  // true after user manually picks from dropdown
     let   _statusFailures = 0;        // consecutive failed status polls
+    let   _ipRefreshInProgress = false;
 
     // All fetch calls go through this so there's always a bounded timeout.
     // Without it, a briefly-unreachable backend leaves the spinner running forever.
@@ -202,22 +203,33 @@
             });
     }
 
+    // [backend key, display label, alwaysShow]
+    // alwaysShow=true: render the row even when the value is absent, showing "—".
     const STATUS_FIELDS = [
-        ['Country',          'Country'],
-        ['City',             'City'],
-        ['Hostname',         'Hostname'],
-        ['Endpoint',         'Endpoint'],
-        ['Load',             'Load'],
-        ['Technology',       'Technology'],
-        ['Current technology', 'Technology'],
-        ['Current protocol', 'Protocol'],
-        ['Uptime',           'Uptime'],
-        ['Latest handshake', 'Last handshake'],
-        ['Received',         'Received'],
-        ['Sent',             'Sent'],
-        ['Public IPv4',      'Public IPv4'],
-        ['Public IPv6',      'Public IPv6'],
+        ['Country',            'Country',        false],
+        ['City',               'City',           false],
+        ['Hostname',           'Hostname',       false],
+        ['Endpoint',           'Endpoint',       false],
+        ['Load',               'Load',           false],
+        ['Technology',         'Technology',     false],
+        ['Current technology', 'Technology',     false],
+        ['Current protocol',   'Protocol',       false],
+        ['Uptime',             'Uptime',         false],
+        ['Latest handshake',   'Last handshake', false],
+        ['Received',           'Received',       false],
+        ['Sent',               'Sent',           false],
+        ['Public IPv4',        'Public IPv4',    true ],
+        ['Public IPv6',        'Public IPv6',    true ],
     ];
+
+    function refreshIPs() {
+        if (_ipRefreshInProgress) return;
+        _ipRefreshInProgress = true;
+        updateStatus(true).finally(() => {
+            // Re-poll after 5 s to pick up the freshly-fetched IPs.
+            setTimeout(() => updateStatus().finally(() => { _ipRefreshInProgress = false; }), 5000);
+        });
+    }
 
     // Sync the server dropdown to cityCode, but only when a matching option exists
     // and the user hasn't made a manual selection since the last connect/load.
@@ -243,10 +255,17 @@
             statusBox.className = 'alert alert-danger ' + baseClasses;
         }
 
-        const fields = data.fields || {};
-        STATUS_FIELDS.forEach(([key, label]) => {
-            const value = fields[key];
-            if (value === undefined || value === null || value === '') return;
+        const fields    = data.fields || {};
+        const connected = data.status === 'Connected';
+        let   ipRefreshBtnAdded = false;
+
+        STATUS_FIELDS.forEach(([key, label, alwaysShow]) => {
+            const value   = fields[key];
+            const isEmpty = value === undefined || value === null || value === '';
+            // alwaysShow rows only appear when connected (no point showing IP rows
+            // when disconnected), but stay visible while IPs are still resolving.
+            if (isEmpty && (!alwaysShow || !connected)) return;
+
             const row = document.createElement('tr');
             const th  = document.createElement('th');
             const td  = document.createElement('td');
@@ -255,7 +274,30 @@
             th.style.width = '40%';
             th.textContent = label;
             td.className = 'font-monospace small';
-            td.textContent = value;
+
+            if (isEmpty) {
+                const placeholder = document.createElement('span');
+                placeholder.className = 'text-muted';
+                placeholder.textContent = '—';
+                td.appendChild(placeholder);
+            } else {
+                td.textContent = value;
+            }
+
+            // Add a single ↻ button on the first IP row so the user can force
+            // a re-lookup after a failed or stale resolution.
+            if (alwaysShow && !ipRefreshBtnAdded) {
+                ipRefreshBtnAdded = true;
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'refresh-btn ms-1' + (_ipRefreshInProgress ? ' spinning' : '');
+                btn.title = 'Refresh IP lookups';
+                btn.setAttribute('aria-label', 'Refresh IP lookups');
+                btn.textContent = '↻';
+                btn.addEventListener('click', refreshIPs);
+                th.appendChild(btn);
+            }
+
             row.appendChild(th);
             row.appendChild(td);
             tbody.appendChild(row);
