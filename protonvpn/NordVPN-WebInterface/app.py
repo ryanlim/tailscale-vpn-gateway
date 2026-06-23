@@ -417,7 +417,7 @@ _EXEMPT_PRIORITY = 99
 
 _lock = threading.Lock()
 _ip_cache: dict = {"v4": None, "v6": None, "ts": 0.0}
-_IP_TTL = 15  # seconds
+_ip_refresh_event = threading.Event()  # set to trigger an immediate background refresh
 
 
 def _eth0_subnet() -> str | None:
@@ -615,12 +615,55 @@ def _fetch_public_ip(family: int) -> dict | None:
     return None
 
 
+def _refresh_ips_now() -> None:
+    """Fetch IPv4 and IPv6 public IPs concurrently and update the cache."""
+    results: list = [None, None]
+
+    def _do(idx: int, family: int) -> None:
+        results[idx] = _fetch_public_ip(family)
+
+    t4 = threading.Thread(target=_do, args=(0, 4), daemon=True)
+    t6 = threading.Thread(target=_do, args=(1, 6), daemon=True)
+    t4.start()
+    t6.start()
+    t4.join(timeout=8)
+    t6.join(timeout=8)
+    if results[0] is not None:
+        _ip_cache["v4"] = results[0]
+    if results[1] is not None:
+        _ip_cache["v6"] = results[1]
+    _ip_cache["ts"] = time.time()
+
+
+class _IpPoller:
+    """Background thread that keeps the public-IP cache fresh.
+
+    Runs every 60 seconds, or immediately when _ip_refresh_event is set.
+    The status endpoint reads from the cache without blocking.
+    """
+    _INTERVAL = 60  # seconds between automatic refreshes
+
+    def start(self) -> None:
+        t = threading.Thread(target=self._run, daemon=True, name="ip-poller")
+        t.start()
+
+    def _run(self) -> None:
+        while True:
+            _ip_refresh_event.wait(timeout=self._INTERVAL)
+            _ip_refresh_event.clear()
+            try:
+                _refresh_ips_now()
+            except Exception:
+                pass
+
+
+_ip_poller = _IpPoller()
+
+
 def _get_public_ips(refresh: bool = False) -> tuple:
-    now = time.time()
-    if refresh or now - _ip_cache["ts"] > _IP_TTL:
-        _ip_cache["v4"] = _fetch_public_ip(4)
-        _ip_cache["v6"] = _fetch_public_ip(6)
-        _ip_cache["ts"] = now
+    """Return cached public IPs. If refresh=True, schedule an immediate background fetch."""
+    if refresh:
+        _ip_refresh_event.set()
     return _ip_cache["v4"], _ip_cache["v6"]
 
 
@@ -875,4 +918,5 @@ def public_ip():
 
 if __name__ == "__main__":
     _cert_refresher.start()
+    _ip_poller.start()
     app.run(host="0.0.0.0", port=80, threaded=True)

@@ -196,7 +196,7 @@
             .finally(() => {
                 _userChangedServer = false;  // allow next renderStatus to sync the dropdown
                 setActionInFlight(false);
-                updateStatus();
+                updateStatus(true);  // force=true triggers background IP refresh on backend
             });
     }
 
