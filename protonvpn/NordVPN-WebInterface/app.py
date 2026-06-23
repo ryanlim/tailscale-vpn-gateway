@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """ProtonVPN WireGuard backend — implements the BACKEND_API v1 contract."""
+import json
 import logging
 import os
 import re
@@ -21,6 +22,44 @@ WG_DIR = Path(os.environ.get("WG_DIR", "/etc/wireguard"))
 WG_CONF = os.environ.get("WG_CONF", str(WG_DIR / "free-us-8.conf"))
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "protonvpn")
 ACTIVE_IFACE_FILE = Path("/tmp/active_wg_iface")
+INDEX_PATH = WG_DIR / "index.json"
+
+# index.json cache — loaded once at first use.
+_index_lock = threading.Lock()
+_index_cache: list | None = None
+
+
+def _load_index() -> list:
+    global _index_cache
+    with _index_lock:
+        if _index_cache is None:
+            try:
+                _index_cache = json.loads(INDEX_PATH.read_text()).get("servers", [])
+                logger.info("Loaded %d servers from index.json", len(_index_cache))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("Could not load index.json: %s", exc)
+                _index_cache = []
+        return _index_cache
+
+
+def _find_conf(stem: str) -> Path | None:
+    """Locate a .conf file by its interface name (stem), checking root then subdirs."""
+    p = WG_DIR / f"{stem}.conf"
+    if p.exists():
+        return p
+    hits = list(WG_DIR.rglob(f"{stem}.conf"))
+    return hits[0] if hits else None
+
+
+def _conf_has_ipv6(conf: Path) -> bool:
+    """Return True if the config's Interface Address includes an IPv6 CIDR."""
+    try:
+        for line in conf.read_text().splitlines():
+            if line.strip().lower().startswith("address"):
+                return ":" in line
+    except OSError:
+        pass
+    return False
 
 # Subnets that must never be routed through the VPN tunnel.
 # Tailscale uses the CGNAT range 100.64.0.0/10 for all device addresses.
@@ -93,7 +132,7 @@ def _exempt_management_del() -> None:
             )
 
 
-def _masquerade_update(old_iface: str | None, new_iface: str | None) -> None:
+def _masquerade_update(old_iface: str | None, new_iface: str | None, ipv6: bool = True) -> None:
     """Remove masquerade rule for old_iface and add one for new_iface.
 
     wg-quick silently skips iptables masquerade in Docker containers because
@@ -101,8 +140,14 @@ def _masquerade_update(old_iface: str | None, new_iface: str | None) -> None:
     forwarded traffic from the Tailscale exit node leaves the container with its
     Docker-bridge source IP, which the ProtonVPN endpoint rejects.  This mirrors
     what entrypoint.sh does at startup, but generalized to any interface switch.
+
+    Pass ipv6=False when the new config has no IPv6 interface address — adding
+    ip6tables MASQUERADE without a source address would drop IPv6 traffic.
     """
-    for cmd in (["iptables"], ["ip6tables"]):
+    commands = [["iptables"]]
+    if ipv6:
+        commands.append(["ip6tables"])
+    for cmd in commands:
         if old_iface:
             subprocess.run(
                 cmd + ["-t", "nat", "-D", "POSTROUTING", "-o", old_iface, "-j", "MASQUERADE"],
@@ -246,8 +291,8 @@ def connect():
     if not target:
         return jsonify({"error": "server is required"}), 400
 
-    conf = WG_DIR / f"{target}.conf"
-    if not conf.exists():
+    conf = _find_conf(target)
+    if conf is None:
         return jsonify({"error": f"Config not found: {target}.conf"}), 400
 
     with _lock:
@@ -275,23 +320,26 @@ def connect():
             # New VPN failed. Restore previous connection so the container
             # isn't left stranded without a working exit path.
             _exempt_management_del()
-            prev_conf = WG_DIR / f"{current}.conf"
-            if prev_conf.exists():
+            prev_conf = _find_conf(current)
+            if prev_conf and prev_conf.exists():
                 try:
                     _exempt_management_add()
                     subprocess.run(
                         ["wg-quick", "up", str(prev_conf)],
                         capture_output=True, timeout=30,
                     )
-                    _masquerade_update(None, current)
+                    _masquerade_update(None, current, _conf_has_ipv6(prev_conf))
                     ACTIVE_IFACE_FILE.write_text(current)
                 except Exception:
                     _exempt_management_del()
             return jsonify({"error": f"wg-quick up failed: {exc.stderr}"}), 500
 
-        # Re-add masquerade for the new interface. wg-quick silently skips this
+        # Re-add masquerade for the new interface. wg-quick silently skips iptables
         # in Docker (src_valid_mark sysctl is read-only), so we do it explicitly.
-        _masquerade_update(None, target)
+        # Only add ip6tables rule if the new config actually has an IPv6 address —
+        # configs downloaded without --ipv6 have no IPv6 interface address and
+        # MASQUERADE would have no valid source.
+        _masquerade_update(None, target, _conf_has_ipv6(conf))
         ACTIVE_IFACE_FILE.write_text(target)
         return jsonify({"message": f"Connected to {target}", "output": result.stdout})
 
@@ -312,10 +360,59 @@ def disconnect():
             return jsonify({"error": exc.stderr}), 400
 
 
+@app.route("/api/v1/countries")
+def countries():
+    """List countries available in the index.json manifest."""
+    index = _load_index()
+    seen: dict[str, str] = {}
+    for s in index:
+        cc = s.get("country", "")
+        if cc and cc not in seen:
+            seen[cc] = cc
+    # Also include root-level configs (they have IPv6 and don't appear in index.json)
+    return jsonify(sorted(seen.keys()))
+
+
 @app.route("/api/v1/servers")
 def servers():
+    """Return server list, optionally filtered by ?country=XX.
+
+    Without a country filter: returns only the root-level configs (the curated
+    IPv6-capable configs).  With ?country=XX: returns all servers for that
+    country from index.json (IPv4-only unless re-downloaded with --ipv6).
+    """
+    country = request.args.get("country", "").upper()
+
+    if country:
+        index = _load_index()
+        results = []
+        for entry in index:
+            if entry.get("country", "").upper() != country:
+                continue
+            stem = Path(entry["path"]).stem
+            city = entry.get("city", "")
+            tier = entry.get("tier", "")
+            load = entry.get("load")
+            label = city or stem
+            if load is not None:
+                label += f"  ({load}% load)"
+            results.append({
+                "code": stem,
+                "name": label,
+                "city": city,
+                "tier": tier,
+                "load": load,
+                "features": entry.get("features", []),
+                "ipv6": False,
+            })
+        return jsonify(results)
+
+    # Default: curated root-level configs (these have IPv6 support).
     confs = sorted(WG_DIR.glob("*.conf"))
-    return jsonify([{"code": c.stem, "name": f"ProtonVPN ({c.stem})"} for c in confs])
+    return jsonify([
+        {"code": c.stem, "name": c.stem, "ipv6": _conf_has_ipv6(c)}
+        for c in confs
+    ])
 
 
 @app.route("/api/v1/servers/refresh", methods=["POST"])

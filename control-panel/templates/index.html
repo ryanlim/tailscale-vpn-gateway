@@ -57,6 +57,12 @@
                 <tbody></tbody>
             </table>
 
+            <!-- Country filter (shown only for backends that expose /countries) -->
+            <div id="countryRow" class="d-none mb-2">
+                <label for="countrySelect" class="form-label text-muted small mb-1">Country</label>
+                <select class="form-select" id="countrySelect"></select>
+            </div>
+
             <!-- Server selector + connect -->
             <form class="mb-2" onsubmit="handleSubmit(event, 'connect');">
                 <select class="form-select mb-2" id="serverSelect" name="server"></select>
@@ -273,7 +279,9 @@
     function loadServers(retryDelay = 2000) {
         if (!currentBackend) return;
         const callerBackend = currentBackend;
-        fetch(backendApi('servers'))
+        const country = document.getElementById('countrySelect').value || '';
+        const url = backendApi('servers' + (country ? '?country=' + encodeURIComponent(country) : ''));
+        fetch(url)
             .then(response => {
                 if (!response.ok) throw new Error('HTTP ' + response.status);
                 return response.json();
@@ -311,22 +319,62 @@
             });
     }
 
+    function loadCountries() {
+        const callerBackend = currentBackend;
+        const countryRow    = document.getElementById('countryRow');
+        const countrySelect = document.getElementById('countrySelect');
+
+        fetch(backendApi('countries'))
+            .then(r => (r.ok ? r.json() : Promise.reject(r.status)))
+            .then(codes => {
+                if (callerBackend !== currentBackend) return;
+                if (!Array.isArray(codes) || codes.length === 0) {
+                    countryRow.classList.add('d-none');
+                    return;
+                }
+                countrySelect.innerHTML = '';
+                // "All / IPv6" option → loads the curated root-level configs.
+                const all = document.createElement('option');
+                all.value = '';
+                all.text  = '— IPv6 servers (recommended) —';
+                countrySelect.add(all);
+                codes.forEach(cc => {
+                    const opt = document.createElement('option');
+                    opt.value = cc;
+                    opt.text  = cc;
+                    countrySelect.add(opt);
+                });
+                countryRow.classList.remove('d-none');
+            })
+            .catch(() => {
+                if (callerBackend !== currentBackend) return;
+                countryRow.classList.add('d-none');
+            });
+    }
+
     function selectBackend(name) {
         currentBackend = name;
         lastStatus = null;
         localStorage.setItem(STORAGE_KEY, name);
         document.getElementById('backendSelect').value = name;
+        document.getElementById('countryRow').classList.add('d-none');
+        document.getElementById('countrySelect').innerHTML = '';
         setServerSelectPlaceholder('Loading server list…');
         document.getElementById('statusText').textContent = 'Status: …';
         updateConnectButton();
         updateActiveBtn();
         updateStatus();
+        loadCountries();
         loadServers();
     }
 
     document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('refreshBtn').addEventListener('click', () => updateStatus(true));
         document.getElementById('backendSelect').addEventListener('change', e => selectBackend(e.target.value));
+        document.getElementById('countrySelect').addEventListener('change', () => {
+            setServerSelectPlaceholder('Loading server list…');
+            loadServers();
+        });
         document.getElementById('serverSelect').addEventListener('change', updateConnectButton);
         document.getElementById('setActiveBtn').addEventListener('click', setActiveBackend);
 
