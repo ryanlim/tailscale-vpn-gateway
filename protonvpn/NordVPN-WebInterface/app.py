@@ -183,6 +183,16 @@ def _wg_show(iface: str | None = None) -> str:
         return ""
 
 
+def _wait_for_handshake(iface: str, timeout: float = 10.0) -> bool:
+    """Poll wg show until a handshake appears or timeout expires."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _is_connected(_wg_show(iface)):
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def _handshake_age(raw: str) -> int | None:
     """Return age of the latest handshake in seconds, or None if absent."""
     m = re.search(r"latest handshake:\s+(.+)", raw)
@@ -349,9 +359,25 @@ def connect():
                     )
                     _masquerade_update(None, current, _conf_has_ipv6(prev_conf))
                     ACTIVE_IFACE_FILE.write_text(current)
-                except Exception:
+                finally:
+                    # Always remove management rules — leaving them breaks routing
+                    # (pref-99 "from eth0-subnet table main" overrides WireGuard).
                     _exempt_management_del()
             return jsonify({"error": f"wg-quick up failed: {exc.stderr}"}), 500
+
+        # Remove management exemption rules now that the new tunnel is up.
+        # They must not persist: the pref-99 "from <eth0-subnet> table main" rule
+        # overrides wg-quick's pref-32765 rule and sends all outbound traffic
+        # through the Docker bridge instead of the WireGuard tunnel.
+        _exempt_management_del()
+
+        # Wait for the WireGuard handshake with the new server before returning.
+        # wg-quick up exits as soon as the interface is configured; the actual
+        # handshake with the peer happens asynchronously and takes 1–3 seconds.
+        # Returning before the handshake means the caller sees "Connected" while
+        # traffic is still being dropped by the peer.
+        if not _wait_for_handshake(target):
+            logger.warning("No WireGuard handshake within 10s for %s", target)
 
         # Re-add masquerade for the new interface. wg-quick silently skips iptables
         # in Docker (src_valid_mark sysctl is read-only), so we do it explicitly.
