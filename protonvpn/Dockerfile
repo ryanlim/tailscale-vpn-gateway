@@ -10,6 +10,18 @@ RUN apt update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
+# The Ubuntu 24.04 resolvconf is a systemd-resolved shim that requires D-Bus,
+# which is unavailable in this container. Replace it with a minimal script that
+# writes DNS directly to /etc/resolv.conf. /usr/local/sbin precedes /usr/sbin
+# in PATH so this takes precedence without touching the package-managed binary.
+RUN printf '#!/bin/sh\n\
+# Minimal resolvconf shim: wg-quick calls -a on up and -d on down.\n\
+case "$1" in\n\
+    -a) cat > /etc/resolv.conf ;;\n\
+    -d) printf "nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n" > /etc/resolv.conf ;;\n\
+esac\n' > /usr/local/sbin/resolvconf && \
+    chmod +x /usr/local/sbin/resolvconf
+
 COPY NordVPN-WebInterface /webapp
 COPY scripts /scripts
 RUN chmod +x /scripts/entrypoint.sh

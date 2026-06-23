@@ -54,9 +54,15 @@ while true; do
         IFACE=$(cat "$ACTIVE_IFACE_FILE" 2>/dev/null || echo "$WG_IFACE")
         CONF="/etc/wireguard/${IFACE}.conf"
         echo "Restarting WireGuard: $IFACE"
+        iptables  -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+        ip6tables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
         wg-quick down "$IFACE" 2>/dev/null || true
         sleep 2
         wg-quick up "$CONF"
+        iptables  -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
+            || iptables  -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+        ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
+            || ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE || true
         UNHEALTHY=0
     fi
 done

@@ -100,16 +100,6 @@
         }
     }
 
-    function loadActiveBackend() {
-        return fetch(PANEL_BASE + 'active-backend')
-            .then(r => r.json())
-            .then(data => {
-                activeBackend = data.name || null;
-                updateActiveBtn();
-            })
-            .catch(() => {});
-    }
-
     function setActiveBackend() {
         if (!currentBackend) return;
         fetch(PANEL_BASE + 'active-backend', {
@@ -334,37 +324,46 @@
         loadServers();
     }
 
-    function loadBackends() {
-        return fetch(PANEL_BASE + 'backends')
-            .then(response => response.json())
-            .then(data => {
-                const backends = (data && data.backends) || [];
-                const select = document.getElementById('backendSelect');
-                select.innerHTML = '';
-                backends.forEach(b => {
-                    const option = document.createElement('option');
-                    option.value = b.name;
-                    option.text  = b.label || b.name;
-                    select.add(option);
-                });
-                if (backends.length === 0) {
-                    showToast('No backends configured.', true);
-                    return;
-                }
-                const stored = localStorage.getItem(STORAGE_KEY);
-                const initial = backends.find(b => b.name === stored)
-                    ? stored
-                    : backends[0].name;
-                selectBackend(initial);
-            });
-    }
-
     document.addEventListener('DOMContentLoaded', () => {
         document.getElementById('refreshBtn').addEventListener('click', () => updateStatus(true));
         document.getElementById('backendSelect').addEventListener('change', e => selectBackend(e.target.value));
         document.getElementById('serverSelect').addEventListener('change', updateConnectButton);
         document.getElementById('setActiveBtn').addEventListener('click', setActiveBackend);
-        loadBackends().then(loadActiveBackend);
+
+        // Fetch backend list and active-backend in parallel so that on cold
+        // reload the dropdown immediately shows whichever backend is routing
+        // traffic, without needing a second round-trip.
+        Promise.all([
+            fetch(PANEL_BASE + 'backends').then(r => r.json()),
+            fetch(PANEL_BASE + 'active-backend').then(r => r.json()).catch(() => ({})),
+        ]).then(([backendsData, activeData]) => {
+            const backends = (backendsData && backendsData.backends) || [];
+            activeBackend = activeData.name || null;
+
+            const select = document.getElementById('backendSelect');
+            select.innerHTML = '';
+            backends.forEach(b => {
+                const option = document.createElement('option');
+                option.value = b.name;
+                option.text  = b.label || b.name;
+                select.add(option);
+            });
+
+            if (backends.length === 0) {
+                showToast('No backends configured.', true);
+                return;
+            }
+
+            const stored = localStorage.getItem(STORAGE_KEY);
+            // Priority: active backend (what's actually routing) → last saved
+            // selection → first backend in list.
+            const initial =
+                (activeBackend && backends.find(b => b.name === activeBackend) ? activeBackend : null) ||
+                (stored       && backends.find(b => b.name === stored)         ? stored        : null) ||
+                backends[0].name;
+            selectBackend(initial);
+        });
+
         pollTimer = setInterval(updateStatus, 10000);
     });
 </script>

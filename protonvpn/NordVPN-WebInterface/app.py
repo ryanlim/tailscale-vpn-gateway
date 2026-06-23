@@ -22,9 +22,102 @@ WG_CONF = os.environ.get("WG_CONF", str(WG_DIR / "free-us-8.conf"))
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "protonvpn")
 ACTIVE_IFACE_FILE = Path("/tmp/active_wg_iface")
 
+# Subnets that must never be routed through the VPN tunnel.
+# Tailscale uses the CGNAT range 100.64.0.0/10 for all device addresses.
+# When wg-quick adds its catch-all routing rule (pref 32765) we need our
+# exemption rules already present at a lower priority number (= higher priority).
+_EXEMPT_RANGES = [
+    r for r in os.environ.get("VPN_EXEMPT_RANGES", "100.64.0.0/10").split(",")
+    if r.strip()
+]
+_EXEMPT_PRIORITY = 99
+
 _lock = threading.Lock()
 _ip_cache: dict = {"v4": None, "v6": None, "ts": 0.0}
 _IP_TTL = 15  # seconds
+
+
+def _eth0_subnet() -> str | None:
+    """Return the IPv4 subnet of eth0 (the Docker bridge), e.g. 172.18.0.0/24."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "show", "dev", "eth0", "scope", "link"],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and "/" in parts[0]:
+                return parts[0]
+    except Exception:
+        pass
+    return None
+
+
+def _exempt_management_add() -> None:
+    """Pin management subnets to the main routing table.
+
+    wg-quick's catch-all rule runs at pref 32765.  By adding our rules at
+    pref 99 BEFORE wg-quick up, the kernel checks them first and keeps
+    Tailscale (100.64.0.0/10) and the Docker bridge subnet reachable through
+    the VPN transition.  Del-before-add keeps the rule set idempotent across
+    multiple connect calls.
+    """
+    ranges = list(_EXEMPT_RANGES)
+    eth0 = _eth0_subnet()
+    if eth0 and eth0 not in ranges:
+        ranges.append(eth0)
+    for cidr in ranges:
+        for flag in ("to", "from"):
+            subprocess.run(
+                ["ip", "rule", "del", flag, cidr, "table", "main"],
+                capture_output=True,
+            )
+            subprocess.run(
+                ["ip", "rule", "add", "priority", str(_EXEMPT_PRIORITY),
+                 flag, cidr, "table", "main"],
+                capture_output=True,
+            )
+
+
+def _exempt_management_del() -> None:
+    """Remove management routing exemptions (call after wg-quick down)."""
+    ranges = list(_EXEMPT_RANGES)
+    eth0 = _eth0_subnet()
+    if eth0 and eth0 not in ranges:
+        ranges.append(eth0)
+    for cidr in ranges:
+        for flag in ("to", "from"):
+            subprocess.run(
+                ["ip", "rule", "del", flag, cidr, "table", "main"],
+                capture_output=True,
+            )
+
+
+def _masquerade_update(old_iface: str | None, new_iface: str | None) -> None:
+    """Remove masquerade rule for old_iface and add one for new_iface.
+
+    wg-quick silently skips iptables masquerade in Docker containers because
+    net.ipv4.conf.all.src_valid_mark is a read-only sysctl.  Without masquerade,
+    forwarded traffic from the Tailscale exit node leaves the container with its
+    Docker-bridge source IP, which the ProtonVPN endpoint rejects.  This mirrors
+    what entrypoint.sh does at startup, but generalized to any interface switch.
+    """
+    for cmd in (["iptables"], ["ip6tables"]):
+        if old_iface:
+            subprocess.run(
+                cmd + ["-t", "nat", "-D", "POSTROUTING", "-o", old_iface, "-j", "MASQUERADE"],
+                capture_output=True,
+            )
+        if new_iface:
+            check = subprocess.run(
+                cmd + ["-t", "nat", "-C", "POSTROUTING", "-o", new_iface, "-j", "MASQUERADE"],
+                capture_output=True,
+            )
+            if check.returncode != 0:
+                subprocess.run(
+                    cmd + ["-t", "nat", "-A", "POSTROUTING", "-o", new_iface, "-j", "MASQUERADE"],
+                    capture_output=True,
+                )
 
 
 def _active_iface() -> str:
@@ -161,19 +254,46 @@ def connect():
         current = _active_iface()
         if current == target:
             return jsonify({"message": f"Already connected to {target}", "output": ""})
+
+        # Pin management routes BEFORE wg-quick touches the routing table so
+        # Tailscale and the Docker bridge stay reachable through the transition.
+        _exempt_management_add()
+
+        # Remove masquerade rule for the outgoing interface.
+        _masquerade_update(current, None)
         try:
             subprocess.run(["wg-quick", "down", current], capture_output=True, timeout=15)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
+
         try:
             result = subprocess.run(
                 ["wg-quick", "up", str(conf)],
                 check=True, capture_output=True, text=True, timeout=30,
             )
-            ACTIVE_IFACE_FILE.write_text(target)
-            return jsonify({"message": f"Connected to {target}", "output": result.stdout})
         except subprocess.CalledProcessError as exc:
+            # New VPN failed. Restore previous connection so the container
+            # isn't left stranded without a working exit path.
+            _exempt_management_del()
+            prev_conf = WG_DIR / f"{current}.conf"
+            if prev_conf.exists():
+                try:
+                    _exempt_management_add()
+                    subprocess.run(
+                        ["wg-quick", "up", str(prev_conf)],
+                        capture_output=True, timeout=30,
+                    )
+                    _masquerade_update(None, current)
+                    ACTIVE_IFACE_FILE.write_text(current)
+                except Exception:
+                    _exempt_management_del()
             return jsonify({"error": f"wg-quick up failed: {exc.stderr}"}), 500
+
+        # Re-add masquerade for the new interface. wg-quick silently skips this
+        # in Docker (src_valid_mark sysctl is read-only), so we do it explicitly.
+        _masquerade_update(None, target)
+        ACTIVE_IFACE_FILE.write_text(target)
+        return jsonify({"message": f"Connected to {target}", "output": result.stdout})
 
 
 @app.route("/api/v1/disconnect", methods=["POST"])
@@ -185,6 +305,8 @@ def disconnect():
                 ["wg-quick", "down", iface],
                 check=True, capture_output=True, text=True, timeout=15,
             )
+            _masquerade_update(iface, None)
+            _exempt_management_del()
             return jsonify({"message": f"Disconnected from {iface}", "output": result.stdout})
         except subprocess.CalledProcessError as exc:
             return jsonify({"error": exc.stderr}), 400
