@@ -71,7 +71,7 @@
 
             <!-- Disconnect -->
             <form onsubmit="handleSubmit(event, 'disconnect');">
-                <button class="btn btn-danger w-100" type="submit">Disconnect from VPN</button>
+                <button class="btn btn-danger w-100" type="submit" id="disconnectBtn">Disconnect from VPN</button>
             </form>
 
         </div>
@@ -85,6 +85,31 @@
     let   activeBackend  = null;  // backend currently routing traffic
     let   lastStatus = null;  // most recent /status response, drives connect-button state
     let   pollTimer = null;
+    let   _actionInFlight = false;
+
+    // All fetch calls go through this so there's always a bounded timeout.
+    // Without it, a briefly-unreachable backend leaves the spinner running forever.
+    function timedFetch(url, options = {}, timeoutMs = 8000) {
+        const ctrl = new AbortController();
+        const id   = setTimeout(() => ctrl.abort(), timeoutMs);
+        return fetch(url, { ...options, signal: ctrl.signal })
+            .finally(() => clearTimeout(id));
+    }
+
+    function setActionInFlight(inFlight, label = 'Connecting…') {
+        _actionInFlight = inFlight;
+        const connectBtn    = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        if (inFlight) {
+            connectBtn.disabled    = true;
+            connectBtn.textContent = label;
+            connectBtn.className   = 'btn btn-secondary w-100';
+            if (disconnectBtn) disconnectBtn.disabled = true;
+        } else {
+            if (disconnectBtn) disconnectBtn.disabled = false;
+            updateConnectButton();
+        }
+    }
 
     function backendApi(suffix) {
         // suffix is e.g. 'status', 'connect', 'status?refresh=1'
@@ -136,7 +161,10 @@
 
     function handleSubmit(event, action) {
         event.preventDefault();
-        if (!currentBackend) return;
+        if (!currentBackend || _actionInFlight) return;
+
+        const label = action === 'connect' ? 'Connecting…' : 'Disconnecting…';
+        setActionInFlight(true, label);
 
         let options;
         if (action === 'connect') {
@@ -150,17 +178,24 @@
             options = {method: 'POST'};
         }
 
-        fetch(backendApi(action), options)
+        // 45 s timeout: backend handshake wait (10 s) + local agent + proxy overhead.
+        timedFetch(backendApi(action), options, 45000)
             .then(response => response.json().then(data => ({ok: response.ok, data})))
             .then(({ok, data}) => {
                 if (ok) {
                     showToast(data.message || 'Success');
-                    updateStatus();
                 } else {
                     showToast('Error: ' + (data.error || 'Unknown error'), true);
                 }
             })
-            .catch(error => showToast('Error: ' + error.message, true));
+            .catch(error => {
+                const msg = error.name === 'AbortError' ? 'Request timed out — check backend logs' : error.message;
+                showToast('Error: ' + msg, true);
+            })
+            .finally(() => {
+                setActionInFlight(false);
+                updateStatus();
+            });
     }
 
     const STATUS_FIELDS = [
@@ -219,6 +254,7 @@
     }
 
     function updateConnectButton() {
+        if (_actionInFlight) return;  // don't clobber the in-flight label/state
         const btn      = document.getElementById('connectBtn');
         const selected = document.getElementById('serverSelect').value;
         const connectedCode = lastStatus && lastStatus.status === 'Connected'
@@ -254,11 +290,12 @@
         const refreshBtn = document.getElementById('refreshBtn');
         if (refreshBtn) refreshBtn.classList.add('spinning');
 
-        return fetch(backendApi('status' + (force ? '?refresh=1' : '')))
+        return timedFetch(backendApi('status' + (force ? '?refresh=1' : '')), {}, 8000)
             .then(response => response.json())
             .then(renderStatus)
             .catch(err => {
-                console.warn('updateStatus failed:', err);
+                const timedOut = err.name === 'AbortError';
+                console.warn('updateStatus ' + (timedOut ? 'timed out' : 'failed:'), err);
                 document.getElementById('statusText').textContent = 'Status: backend unreachable';
             })
             .finally(() => {
