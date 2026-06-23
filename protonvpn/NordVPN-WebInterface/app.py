@@ -712,7 +712,7 @@ def connect():
                 ["wg-quick", "up", str(conf)],
                 check=True, capture_output=True, text=True, timeout=30,
             )
-        except subprocess.CalledProcessError as exc:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             # New VPN failed. Restore previous connection so the container
             # isn't left stranded without a working exit path.
             _exempt_management_del()
@@ -730,7 +730,8 @@ def connect():
                     # Always remove management rules — leaving them breaks routing
                     # (pref-99 "from eth0-subnet table main" overrides WireGuard).
                     _exempt_management_del()
-            return jsonify({"error": f"wg-quick up failed: {exc.stderr}"}), 500
+            err = getattr(exc, 'stderr', None) or 'wg-quick timed out'
+            return jsonify({"error": f"wg-quick up failed: {err}"}), 500
 
         # Remove management exemption rules now that the new tunnel is up.
         # They must not persist: the pref-99 "from <eth0-subnet> table main" rule

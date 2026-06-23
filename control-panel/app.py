@@ -47,7 +47,7 @@ def _resolve_cached(host: str, family: int) -> str:
     with _dns_lock:
         _dns_cache[key] = (time.monotonic(), addr)
     return addr
-PROXY_TIMEOUT = 30  # seconds; status polls etc. should be well under this
+PROXY_TIMEOUT = 60  # seconds; connect/disconnect can take 20-30 s (wg-quick + handshake)
 # Hop-by-hop headers per RFC 7230 §6.1 — never forward these on either leg.
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
