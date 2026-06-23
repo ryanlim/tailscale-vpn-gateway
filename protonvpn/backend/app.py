@@ -644,7 +644,11 @@ def _refresh_ips_now() -> None:
         _ip_cache["v4"] = results[0]
     if results[1] is not None:
         _ip_cache["v6"] = results[1]
-    _ip_cache["ts"] = time.time()
+    # Only advance the timestamp when at least one lookup succeeded — if both
+    # fail (tunnel not yet established) keep ts stale so the poller retries
+    # on the next wakeup rather than resetting the 60 s window.
+    if results[0] is not None or results[1] is not None:
+        _ip_cache["ts"] = time.time()
 
 
 class _IpPoller:
@@ -751,6 +755,11 @@ def connect():
         if current == iface:
             return jsonify({"message": f"Already connected to {iface}", "output": ""})
 
+        # Clear stale IP cache so the status endpoint shows no IPs rather than
+        # the previous server's location while the new tunnel is establishing.
+        _ip_cache["v4"] = None
+        _ip_cache["v6"] = None
+
         _exempt_management_add()
         _masquerade_update(current, None)
         try:
@@ -782,13 +791,25 @@ def connect():
 
         _exempt_management_del()
 
-        if not _wait_for_handshake(iface):
-            logger.warning("No WireGuard handshake within 10s for %s", iface)
-
-        _local_agent.start()
-
+        # Apply masquerade and record the active iface immediately so the status
+        # endpoint reflects the new server without waiting for the handshake.
         _masquerade_update(None, iface, _conf_has_ipv6(conf))
         ACTIVE_IFACE_FILE.write_text(iface)
+
+        # Wait for the WireGuard handshake and start the local agent in the
+        # background so the HTTP response returns as soon as wg-quick up exits.
+        # Distant servers (e.g. Asia from the US) can take several seconds to
+        # complete the handshake; blocking here made the control panel appear hung.
+        _iface_snapshot = iface
+        def _post_up() -> None:
+            if not _wait_for_handshake(_iface_snapshot, timeout=30.0):
+                logger.warning("WireGuard handshake with %s did not complete within 30s", _iface_snapshot)
+            _local_agent.start()
+            # Refresh public IPs now that the tunnel is established, so the
+            # status shows the new server's location rather than stale data.
+            _ip_refresh_event.set()
+        threading.Thread(target=_post_up, daemon=True, name=f"post-up-{iface}").start()
+
         return jsonify({"message": f"Connected to {target}", "output": result.stdout})
 
 

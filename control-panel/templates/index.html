@@ -179,8 +179,9 @@
             options = {method: 'POST'};
         }
 
-        // 45 s timeout: backend handshake wait (10 s) + local agent + proxy overhead.
-        timedFetch(backendApi(action), options, 45000)
+        // 15 s timeout: wg-quick down + up take ~1 s each; the handshake and
+        // local agent now run in the background so the backend responds quickly.
+        timedFetch(backendApi(action), options, 15000)
             .then(response => response.json().then(data => ({ok: response.ok, data})))
             .then(({ok, data}) => {
                 if (ok) {
@@ -339,7 +340,7 @@
         if (!currentBackend) return;
         const callerBackend = currentBackend;
 
-        fetch(backendApi('servers'))
+        timedFetch(backendApi('servers'), {}, 8000)
             .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
             .then(servers => {
                 if (callerBackend !== currentBackend) return;
@@ -356,9 +357,9 @@
             })
             .catch(err => {
                 if (callerBackend !== currentBackend) return;
-                console.warn('loadServers failed, retrying:', err);
-                setServerSelectPlaceholder('Loading server list…');
-                setTimeout(() => loadServers(Math.min(retryDelay * 2, 60000)), retryDelay);
+                console.warn('loadServers failed, retrying in', retryDelay, 'ms:', err);
+                setServerSelectPlaceholder('Retrying…');
+                setTimeout(() => loadServers(Math.min(retryDelay * 2, 30000)), retryDelay);
             });
     }
 
@@ -367,7 +368,7 @@
         const callerBackend = currentBackend;
         setServerSelectPlaceholder('Loading cities…');
 
-        fetch(backendApi('cities?country=' + encodeURIComponent(country)))
+        timedFetch(backendApi('cities?country=' + encodeURIComponent(country)), {}, 8000)
             .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
             .then(items => {
                 if (callerBackend !== currentBackend) return;
@@ -390,7 +391,7 @@
         const countryRow    = document.getElementById('countryRow');
         const countrySelect = document.getElementById('countrySelect');
 
-        fetch(backendApi('countries'))
+        timedFetch(backendApi('countries'), {}, 8000)
             .then(r => (r.ok ? r.json() : Promise.reject(r.status)))
             .then(codes => {
                 if (callerBackend !== currentBackend) return;
@@ -451,8 +452,8 @@
         // reload the dropdown immediately shows whichever backend is routing
         // traffic, without needing a second round-trip.
         Promise.all([
-            fetch(PANEL_BASE + 'backends').then(r => r.json()),
-            fetch(PANEL_BASE + 'active-backend').then(r => r.json()).catch(() => ({})),
+            timedFetch(PANEL_BASE + 'backends', {}, 8000).then(r => r.json()),
+            timedFetch(PANEL_BASE + 'active-backend', {}, 8000).then(r => r.json()).catch(() => ({})),
         ]).then(([backendsData, activeData]) => {
             const backends = (backendsData && backendsData.backends) || [];
             activeBackend = activeData.name || null;
