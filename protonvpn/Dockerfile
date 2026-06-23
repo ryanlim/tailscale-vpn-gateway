@@ -22,7 +22,7 @@ case "$1" in\n\
 esac\n' > /usr/local/sbin/resolvconf && \
     chmod +x /usr/local/sbin/resolvconf
 
-COPY NordVPN-WebInterface /webapp
+COPY backend /webapp
 COPY scripts /scripts
 RUN chmod +x /scripts/entrypoint.sh
 

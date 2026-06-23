@@ -8,3 +8,4 @@ __pycache__/
 *.pyc
 /nordvpn-wg/wireguard/
 /protonvpn/wireguard/
+/install-cert.sh
