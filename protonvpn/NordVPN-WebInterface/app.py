@@ -291,6 +291,24 @@ def connect():
     if not target:
         return jsonify({"error": "server is required"}), 400
 
+    # City-level selection: auto-pick the lowest-load server for COUNTRY/CITY.
+    if target.startswith("_city:"):
+        parts = target.split(":", 2)
+        if len(parts) != 3:
+            return jsonify({"error": f"Invalid city code: {target}"}), 400
+        _, country, city = parts
+        index = _load_index()
+        candidates = [
+            s for s in index
+            if s.get("country", "").upper() == country.upper()
+            and (s.get("city") or "") == city
+        ]
+        if not candidates:
+            return jsonify({"error": f"No servers found for {country}/{city}"}), 404
+        best = min(candidates, key=lambda s: s.get("load") or 999)
+        target = Path(best["path"]).stem
+        logger.info("City auto-select %s/%s → %s (load=%s)", country, city, target, best.get("load"))
+
     conf = _find_conf(target)
     if conf is None:
         return jsonify({"error": f"Config not found: {target}.conf"}), 400
@@ -364,50 +382,70 @@ def disconnect():
 def countries():
     """List countries available in the index.json manifest."""
     index = _load_index()
-    seen: dict[str, str] = {}
+    seen: set[str] = set()
     for s in index:
         cc = s.get("country", "")
-        if cc and cc not in seen:
-            seen[cc] = cc
-    # Also include root-level configs (they have IPv6 and don't appear in index.json)
-    return jsonify(sorted(seen.keys()))
+        if cc:
+            seen.add(cc)
+    return jsonify(sorted(seen))
+
+
+@app.route("/api/v1/cities")
+def cities():
+    """Return cities for a country, sorted by minimum server load.
+
+    GET /api/v1/cities?country=US
+    Each entry has code=_city:COUNTRY:CITY which connect() resolves to the
+    lowest-load server in that city at connect time.
+    """
+    country = request.args.get("country", "").upper()
+    if not country:
+        return jsonify([])
+    index = _load_index()
+    city_map: dict[str, dict] = {}
+    for s in index:
+        if s.get("country", "").upper() != country:
+            continue
+        city = s.get("city") or "Unknown"
+        load = s.get("load")
+        if city not in city_map:
+            city_map[city] = {"min_load": None, "count": 0}
+        city_map[city]["count"] += 1
+        if load is not None:
+            prev = city_map[city]["min_load"]
+            if prev is None or load < prev:
+                city_map[city]["min_load"] = load
+
+    result = []
+    for city, data in city_map.items():
+        min_load = data["min_load"]
+        load_str = f"{min_load}%" if min_load is not None else "?"
+        result.append({
+            "code": f"_city:{country}:{city}",
+            "name": f"{city}  —  {load_str} min load, {data['count']} servers",
+            "city": city,
+            "min_load": min_load if min_load is not None else 999,
+        })
+    result.sort(key=lambda x: x["min_load"])
+    return jsonify(result)
+
+
+@app.route("/api/v1/index-info")
+def index_info():
+    """Return metadata about the local index.json (generation timestamp, count)."""
+    try:
+        raw = json.loads(INDEX_PATH.read_text())
+        return jsonify({
+            "generated": raw.get("generated"),
+            "server_count": len(raw.get("servers", [])),
+        })
+    except (OSError, json.JSONDecodeError):
+        return jsonify({"generated": None, "server_count": 0})
 
 
 @app.route("/api/v1/servers")
 def servers():
-    """Return server list, optionally filtered by ?country=XX.
-
-    Without a country filter: returns only the root-level configs (the curated
-    IPv6-capable configs).  With ?country=XX: returns all servers for that
-    country from index.json (IPv4-only unless re-downloaded with --ipv6).
-    """
-    country = request.args.get("country", "").upper()
-
-    if country:
-        index = _load_index()
-        results = []
-        for entry in index:
-            if entry.get("country", "").upper() != country:
-                continue
-            stem = Path(entry["path"]).stem
-            city = entry.get("city", "")
-            tier = entry.get("tier", "")
-            load = entry.get("load")
-            label = city or stem
-            if load is not None:
-                label += f"  ({load}% load)"
-            results.append({
-                "code": stem,
-                "name": label,
-                "city": city,
-                "tier": tier,
-                "load": load,
-                "features": entry.get("features", []),
-                "ipv6": False,
-            })
-        return jsonify(results)
-
-    # Default: curated root-level configs (these have IPv6 support).
+    """Return the curated root-level configs (IPv6-capable, no country filter needed)."""
     confs = sorted(WG_DIR.glob("*.conf"))
     return jsonify([
         {"code": c.stem, "name": c.stem, "ipv6": _conf_has_ipv6(c)}

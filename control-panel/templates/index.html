@@ -68,6 +68,7 @@
                 <select class="form-select mb-2" id="serverSelect" name="server"></select>
                 <button class="btn btn-success w-100" type="submit" id="connectBtn">Connect to VPN</button>
             </form>
+            <p class="text-muted small mb-0 d-none" id="loadNote"></p>
 
             <!-- Disconnect -->
             <form onsubmit="handleSubmit(event, 'disconnect');">
@@ -276,37 +277,33 @@
         serverSelect.add(option);
     }
 
+    function fillSelect(selectEl, items) {
+        selectEl.innerHTML = '';
+        items.forEach(item => {
+            const opt = document.createElement('option');
+            opt.value = item.code;
+            opt.text  = item.name;
+            selectEl.add(opt);
+        });
+    }
+
     function loadServers(retryDelay = 2000) {
         if (!currentBackend) return;
         const callerBackend = currentBackend;
-        const country = document.getElementById('countrySelect').value || '';
-        const url = backendApi('servers' + (country ? '?country=' + encodeURIComponent(country) : ''));
-        fetch(url)
-            .then(response => {
-                if (!response.ok) throw new Error('HTTP ' + response.status);
-                return response.json();
-            })
-            .then(servers => {
-                // If user switched backend mid-flight, drop the result.
-                if (callerBackend !== currentBackend) return;
-                if (!Array.isArray(servers)) {
-                    throw new Error('unexpected response: ' + JSON.stringify(servers));
-                }
-                const serverSelect = document.getElementById('serverSelect');
-                serverSelect.innerHTML = '';
-                servers.forEach(server => {
-                    const option = document.createElement('option');
-                    option.value = server.code;
-                    option.text  = server.name;
-                    serverSelect.add(option);
-                });
+        const loadNote = document.getElementById('loadNote');
+        loadNote.classList.add('d-none');
 
-                // Pre-select the currently connected city, if any
+        fetch(backendApi('servers'))
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+            .then(servers => {
+                if (callerBackend !== currentBackend) return;
+                if (!Array.isArray(servers)) throw new Error('bad response');
+                fillSelect(document.getElementById('serverSelect'), servers);
                 fetch(backendApi('status'))
-                    .then(response => response.json())
+                    .then(r => r.json())
                     .then(data => {
                         if (callerBackend !== currentBackend) return;
-                        if (data.city_code) serverSelect.value = data.city_code;
+                        if (data.city_code) document.getElementById('serverSelect').value = data.city_code;
                         updateConnectButton();
                     });
             })
@@ -314,9 +311,44 @@
                 if (callerBackend !== currentBackend) return;
                 console.warn('loadServers failed, retrying:', err);
                 setServerSelectPlaceholder('Loading server list…');
-                const next = Math.min(retryDelay * 2, 60000);
-                setTimeout(() => loadServers(next), retryDelay);
+                setTimeout(() => loadServers(Math.min(retryDelay * 2, 60000)), retryDelay);
             });
+    }
+
+    function loadCities(country) {
+        if (!currentBackend) return;
+        const callerBackend = currentBackend;
+        const loadNote = document.getElementById('loadNote');
+        loadNote.classList.add('d-none');
+        setServerSelectPlaceholder('Loading cities…');
+
+        fetch(backendApi('cities?country=' + encodeURIComponent(country)))
+            .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+            .then(items => {
+                if (callerBackend !== currentBackend) return;
+                if (!Array.isArray(items) || items.length === 0) {
+                    setServerSelectPlaceholder('No cities found');
+                    return;
+                }
+                fillSelect(document.getElementById('serverSelect'), items);
+                updateConnectButton();
+            })
+            .catch(err => {
+                if (callerBackend !== currentBackend) return;
+                console.warn('loadCities failed:', err);
+                setServerSelectPlaceholder('Could not load cities');
+            });
+
+        // Show the stale-load note and fetch timestamp from the backend.
+        fetch(backendApi('index-info'))
+            .then(r => r.ok ? r.json() : null)
+            .then(info => {
+                if (callerBackend !== currentBackend || !info) return;
+                const ts = info.generated ? new Date(info.generated).toLocaleString() : 'unknown';
+                loadNote.textContent = `Load values are from the last server download (${ts}). Re-run download_wg_configs.py to refresh.`;
+                loadNote.classList.remove('d-none');
+            })
+            .catch(() => {});
     }
 
     function loadCountries() {
@@ -333,7 +365,6 @@
                     return;
                 }
                 countrySelect.innerHTML = '';
-                // "All / IPv6" option → loads the curated root-level configs.
                 const all = document.createElement('option');
                 all.value = '';
                 all.text  = '— IPv6 servers (recommended) —';
@@ -359,6 +390,7 @@
         document.getElementById('backendSelect').value = name;
         document.getElementById('countryRow').classList.add('d-none');
         document.getElementById('countrySelect').innerHTML = '';
+        document.getElementById('loadNote').classList.add('d-none');
         setServerSelectPlaceholder('Loading server list…');
         document.getElementById('statusText').textContent = 'Status: …';
         updateConnectButton();
@@ -372,8 +404,13 @@
         document.getElementById('refreshBtn').addEventListener('click', () => updateStatus(true));
         document.getElementById('backendSelect').addEventListener('change', e => selectBackend(e.target.value));
         document.getElementById('countrySelect').addEventListener('change', () => {
-            setServerSelectPlaceholder('Loading server list…');
-            loadServers();
+            const country = document.getElementById('countrySelect').value;
+            if (country) {
+                loadCities(country);
+            } else {
+                document.getElementById('loadNote').classList.add('d-none');
+                loadServers();
+            }
         });
         document.getElementById('serverSelect').addEventListener('change', updateConnectButton);
         document.getElementById('setActiveBtn').addEventListener('click', setActiveBackend);
