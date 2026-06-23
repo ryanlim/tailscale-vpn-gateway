@@ -5,6 +5,8 @@ import logging
 import os
 import random
 import re
+import socket
+import ssl
 import subprocess
 import threading
 import time
@@ -24,6 +26,96 @@ WG_CONF = os.environ.get("WG_CONF", str(WG_DIR / "free-us-8.conf"))
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "protonvpn")
 ACTIVE_IFACE_FILE = Path("/tmp/active_wg_iface")
 INDEX_PATH = WG_DIR / "index.json"
+
+# ProtonVPN local agent — TLS authentication required for paid servers.
+# The server jails new WireGuard sessions until the client presents its
+# Ed25519 certificate over TLS to 10.2.0.1:65432 inside the tunnel.
+# Credentials are written to this directory by the setup script.
+LOCAL_AGENT_HOST = "10.2.0.1"
+LOCAL_AGENT_PORT = 65432
+LOCAL_AGENT_CERT = WG_DIR / "proton_auth" / "client.pem"
+LOCAL_AGENT_KEY  = WG_DIR / "proton_auth" / "client.key"
+
+
+class _LocalAgent:
+    """Maintain TLS connection to ProtonVPN local agent (10.2.0.1:65432).
+
+    ProtonVPN paid servers block internet forwarding until the client
+    presents a valid Ed25519 client certificate over TLS.  This class
+    keeps that connection alive in a daemon thread for as long as the
+    VPN session is active.
+    """
+
+    def __init__(self):
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
+            return
+        self.stop()
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="local-agent")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+        self._thread = None
+
+    def _make_ctx(self) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.load_cert_chain(certfile=str(LOCAL_AGENT_CERT), keyfile=str(LOCAL_AGENT_KEY))
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        return ctx
+
+    def _run(self) -> None:
+        ctx = self._make_ctx()
+        while not self._stop.is_set():
+            try:
+                with socket.create_connection(
+                    (LOCAL_AGENT_HOST, LOCAL_AGENT_PORT), timeout=10
+                ) as raw:
+                    with ctx.wrap_socket(raw, server_hostname=LOCAL_AGENT_HOST) as s:
+                        s.settimeout(5)
+                        data = s.recv(4096)
+                        if len(data) > 4:
+                            try:
+                                msg = json.loads(data[4:])
+                                state = msg.get("status", {}).get("state", "")
+                                if state == "connected":
+                                    logger.info("Local agent: connected")
+                                else:
+                                    err = msg.get("error", {})
+                                    code = err.get("code", 0)
+                                    desc = err.get("description", "unknown")
+                                    logger.warning("Local agent rejected (code %s): %s", code, desc)
+                                    if code == 86202:
+                                        # WireGuard key doesn't match certificate —
+                                        # permanent config error, no point retrying.
+                                        return
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+
+                        # Keep connection alive until stopped or server closes it.
+                        while not self._stop.is_set():
+                            s.settimeout(5)
+                            try:
+                                chunk = s.recv(4096)
+                                if not chunk:
+                                    break
+                            except TimeoutError:
+                                pass
+            except OSError as exc:
+                if not self._stop.is_set():
+                    logger.debug("Local agent connection failed: %s", exc)
+                    self._stop.wait(10)
+
+
+_local_agent = _LocalAgent()
 
 # index.json cache — loaded once at first use.
 _index_lock = threading.Lock()
@@ -145,9 +237,12 @@ def _masquerade_update(old_iface: str | None, new_iface: str | None, ipv6: bool 
     Pass ipv6=False when the new config has no IPv6 interface address — adding
     ip6tables MASQUERADE without a source address would drop IPv6 traffic.
     """
-    commands = [["iptables"]]
+    # Use iptables-legacy: in this container the kernel's NAT hook is registered
+    # by the legacy netfilter stack, not nftables. iptables-nft rules are silently
+    # ignored for POSTROUTING SNAT/MASQUERADE (they match 0 packets).
+    commands = [["iptables-legacy"]]
     if ipv6:
-        commands.append(["ip6tables"])
+        commands.append(["ip6tables-legacy"])
     for cmd in commands:
         if old_iface:
             subprocess.run(
@@ -160,10 +255,13 @@ def _masquerade_update(old_iface: str | None, new_iface: str | None, ipv6: bool 
                 capture_output=True,
             )
             if check.returncode != 0:
-                subprocess.run(
+                add = subprocess.run(
                     cmd + ["-t", "nat", "-A", "POSTROUTING", "-o", new_iface, "-j", "MASQUERADE"],
                     capture_output=True,
                 )
+                if add.returncode != 0:
+                    logger.warning("MASQUERADE add failed (%s -o %s): %s",
+                                   cmd[0], new_iface, add.stderr.decode().strip())
 
 
 def _active_iface() -> str:
@@ -171,6 +269,19 @@ def _active_iface() -> str:
         return ACTIVE_IFACE_FILE.read_text().strip()
     except OSError:
         return Path(WG_CONF).stem
+
+
+def _wg_down(iface: str, timeout: float = 15) -> None:
+    """Bring down a WireGuard interface, resolving subdirectory config paths.
+
+    wg-quick down requires the .conf file to remove routes.  For configs that
+    live under a subdirectory (e.g. US/Dallas/us-tx_425.conf), passing only
+    the interface name would cause wg-quick to look in /etc/wireguard/ and fail.
+    """
+    conf = _find_conf(iface)
+    cmd = ["wg-quick", "down", str(conf)] if conf and conf.exists() \
+        else ["wg-quick", "down", iface]
+    subprocess.run(cmd, capture_output=True, timeout=timeout)
 
 
 def _wg_show(iface: str | None = None) -> str:
@@ -324,10 +435,14 @@ def connect():
     if conf is None:
         return jsonify({"error": f"Config not found: {target}.conf"}), 400
 
+    # The WireGuard interface name is always the config basename (stem), regardless
+    # of whether target was supplied as a path ("US/Dallas/us-tx_477") or bare name.
+    iface = conf.stem
+
     with _lock:
         current = _active_iface()
-        if current == target:
-            return jsonify({"message": f"Already connected to {target}", "output": ""})
+        if current == iface:
+            return jsonify({"message": f"Already connected to {iface}", "output": ""})
 
         # Pin management routes BEFORE wg-quick touches the routing table so
         # Tailscale and the Docker bridge stay reachable through the transition.
@@ -336,7 +451,7 @@ def connect():
         # Remove masquerade rule for the outgoing interface.
         _masquerade_update(current, None)
         try:
-            subprocess.run(["wg-quick", "down", current], capture_output=True, timeout=15)
+            _wg_down(current)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
             pass
 
@@ -376,16 +491,20 @@ def connect():
         # handshake with the peer happens asynchronously and takes 1–3 seconds.
         # Returning before the handshake means the caller sees "Connected" while
         # traffic is still being dropped by the peer.
-        if not _wait_for_handshake(target):
-            logger.warning("No WireGuard handshake within 10s for %s", target)
+        if not _wait_for_handshake(iface):
+            logger.warning("No WireGuard handshake within 10s for %s", iface)
+
+        # Authenticate with the ProtonVPN local agent (10.2.0.1:65432) so that
+        # paid servers release the session from "jailed" (no egress) to "connected".
+        _local_agent.start()
 
         # Re-add masquerade for the new interface. wg-quick silently skips iptables
         # in Docker (src_valid_mark sysctl is read-only), so we do it explicitly.
         # Only add ip6tables rule if the new config actually has an IPv6 address —
         # configs downloaded without --ipv6 have no IPv6 interface address and
         # MASQUERADE would have no valid source.
-        _masquerade_update(None, target, _conf_has_ipv6(conf))
-        ACTIVE_IFACE_FILE.write_text(target)
+        _masquerade_update(None, iface, _conf_has_ipv6(conf))
+        ACTIVE_IFACE_FILE.write_text(iface)
         return jsonify({"message": f"Connected to {target}", "output": result.stdout})
 
 
@@ -394,10 +513,11 @@ def disconnect():
     with _lock:
         iface = _active_iface()
         try:
-            result = subprocess.run(
-                ["wg-quick", "down", iface],
-                check=True, capture_output=True, text=True, timeout=15,
-            )
+            conf = _find_conf(iface)
+            cmd = ["wg-quick", "down", str(conf)] if conf and conf.exists() \
+                else ["wg-quick", "down", iface]
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=15)
+            _local_agent.stop()
             _masquerade_update(iface, None)
             _exempt_management_del()
             return jsonify({"message": f"Disconnected from {iface}", "output": result.stdout})

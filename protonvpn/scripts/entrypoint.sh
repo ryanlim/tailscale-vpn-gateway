@@ -24,10 +24,10 @@ echo "$WG_IFACE" > "$ACTIVE_IFACE_FILE"
 # (read-only sysctl), so its iptables/ip6tables masquerade rules are silently
 # skipped.  Add them explicitly so forwarded traffic (e.g. from the Tailscale
 # exit node) is masqueraded to the WireGuard address before entering the tunnel.
-iptables  -t nat -C POSTROUTING -o "$WG_IFACE" -j MASQUERADE 2>/dev/null \
-    || iptables  -t nat -A POSTROUTING -o "$WG_IFACE" -j MASQUERADE
-ip6tables -t nat -C POSTROUTING -o "$WG_IFACE" -j MASQUERADE 2>/dev/null \
-    || ip6tables -t nat -A POSTROUTING -o "$WG_IFACE" -j MASQUERADE || true
+iptables-legacy  -t nat -C POSTROUTING -o "$WG_IFACE" -j MASQUERADE 2>/dev/null \
+    || iptables-legacy  -t nat -A POSTROUTING -o "$WG_IFACE" -j MASQUERADE
+ip6tables-legacy -t nat -C POSTROUTING -o "$WG_IFACE" -j MASQUERADE 2>/dev/null \
+    || ip6tables-legacy -t nat -A POSTROUTING -o "$WG_IFACE" -j MASQUERADE || true
 
 nohup python3 /webapp/app.py > /tmp/webapp.log 2>&1 &
 
@@ -52,17 +52,18 @@ while true; do
 
     if [ "$UNHEALTHY" -ge "$UNHEALTHY_THRESHOLD" ]; then
         IFACE=$(cat "$ACTIVE_IFACE_FILE" 2>/dev/null || echo "$WG_IFACE")
-        CONF="/etc/wireguard/${IFACE}.conf"
+        CONF=$(find /etc/wireguard -name "${IFACE}.conf" 2>/dev/null | head -1)
+        CONF="${CONF:-/etc/wireguard/${IFACE}.conf}"
         echo "Restarting WireGuard: $IFACE"
-        iptables  -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-        ip6tables -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-        wg-quick down "$IFACE" 2>/dev/null || true
+        iptables-legacy  -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+        ip6tables-legacy -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+        wg-quick down "${CONF:-$IFACE}" 2>/dev/null || true
         sleep 2
         wg-quick up "$CONF"
-        iptables  -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
-            || iptables  -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
-        ip6tables -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
-            || ip6tables -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE || true
+        iptables-legacy  -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
+            || iptables-legacy  -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+        ip6tables-legacy -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
+            || ip6tables-legacy -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE || true
         UNHEALTHY=0
     fi
 done
