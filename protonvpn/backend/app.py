@@ -536,6 +536,8 @@ def _wg_down(iface: str, timeout: float = 15) -> None:
     live under a subdirectory (e.g. US/Dallas/us-tx_425.conf), passing only
     the interface name would cause wg-quick to look in /etc/wireguard/ and fail.
     """
+    if not iface:
+        return
     conf = _find_conf(iface)
     cmd = ["wg-quick", "down", str(conf)] if conf and conf.exists() \
         else ["wg-quick", "down", iface]
@@ -752,7 +754,7 @@ def connect():
 
     with _lock:
         current = _active_iface()
-        if current == iface:
+        if current and current == iface and _wg_show(iface):
             return jsonify({"message": f"Already connected to {iface}", "output": ""})
 
         # Clear stale IP cache so the status endpoint shows no IPs rather than
@@ -825,6 +827,10 @@ def disconnect():
             _local_agent.stop()
             _masquerade_update(iface, None)
             _exempt_management_del()
+            # Clear the active interface record so a subsequent connect() that
+            # randomly picks the same interface name does not short-circuit with
+            # "Already connected" while the tunnel is actually down.
+            ACTIVE_IFACE_FILE.write_text("")
             return jsonify({"message": f"Disconnected from {iface}", "output": result.stdout})
         except subprocess.CalledProcessError as exc:
             return jsonify({"error": exc.stderr}), 400
