@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import threading
@@ -305,9 +306,9 @@ def connect():
         ]
         if not candidates:
             return jsonify({"error": f"No servers found for {country}/{city}"}), 404
-        best = min(candidates, key=lambda s: s.get("load") or 999)
+        best = random.choice(candidates)
         target = Path(best["path"]).stem
-        logger.info("City auto-select %s/%s → %s (load=%s)", country, city, target, best.get("load"))
+        logger.info("City random-select %s/%s → %s", country, city, target)
 
     conf = _find_conf(target)
     if conf is None:
