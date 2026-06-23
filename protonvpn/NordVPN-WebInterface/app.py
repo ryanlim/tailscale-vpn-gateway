@@ -37,6 +37,47 @@ LOCAL_AGENT_PORT = 65432
 LOCAL_AGENT_CERT = WG_DIR / "proton_auth" / "client.pem"
 LOCAL_AGENT_KEY  = WG_DIR / "proton_auth" / "client.key"
 
+_CC_TO_NAME: dict[str, str] = {
+    "AD": "Andorra", "AE": "United Arab Emirates", "AF": "Afghanistan",
+    "AL": "Albania", "AM": "Armenia", "AO": "Angola", "AR": "Argentina",
+    "AT": "Austria", "AU": "Australia", "AZ": "Azerbaijan", "BA": "Bosnia",
+    "BD": "Bangladesh", "BE": "Belgium", "BG": "Bulgaria", "BH": "Bahrain",
+    "BN": "Brunei", "BO": "Bolivia", "BR": "Brazil", "BT": "Bhutan",
+    "BY": "Belarus", "CA": "Canada", "CD": "DR Congo", "CH": "Switzerland",
+    "CI": "Ivory Coast", "CL": "Chile", "CM": "Cameroon", "CO": "Colombia",
+    "CR": "Costa Rica", "CU": "Cuba", "CY": "Cyprus", "CZ": "Czech Republic",
+    "DE": "Germany", "DK": "Denmark", "DO": "Dominican Republic", "DZ": "Algeria",
+    "EC": "Ecuador", "EE": "Estonia", "EG": "Egypt", "ER": "Eritrea",
+    "ES": "Spain", "ET": "Ethiopia", "FI": "Finland", "FR": "France",
+    "GA": "Gabon", "GE": "Georgia", "GH": "Ghana", "GL": "Greenland",
+    "GN": "Guinea", "GR": "Greece", "GT": "Guatemala", "HK": "Hong Kong",
+    "HN": "Honduras", "HR": "Croatia", "HT": "Haiti", "HU": "Hungary",
+    "ID": "Indonesia", "IE": "Ireland", "IL": "Israel", "IN": "India",
+    "IQ": "Iraq", "IS": "Iceland", "IT": "Italy", "JM": "Jamaica",
+    "JO": "Jordan", "JP": "Japan", "KE": "Kenya", "KG": "Kyrgyzstan",
+    "KH": "Cambodia", "KM": "Comoros", "KR": "South Korea", "KW": "Kuwait",
+    "KZ": "Kazakhstan", "LA": "Laos", "LB": "Lebanon", "LI": "Liechtenstein",
+    "LK": "Sri Lanka", "LT": "Lithuania", "LU": "Luxembourg", "LV": "Latvia",
+    "LY": "Libya", "MA": "Morocco", "MC": "Monaco", "MD": "Moldova",
+    "ME": "Montenegro", "MK": "North Macedonia", "MM": "Myanmar", "MN": "Mongolia",
+    "MO": "Macau", "MR": "Mauritania", "MT": "Malta", "MU": "Mauritius",
+    "MX": "Mexico", "MY": "Malaysia", "MZ": "Mozambique", "NG": "Nigeria",
+    "NI": "Nicaragua", "NL": "Netherlands", "NO": "Norway", "NP": "Nepal",
+    "NZ": "New Zealand", "OM": "Oman", "PA": "Panama", "PE": "Peru",
+    "PG": "Papua New Guinea", "PH": "Philippines", "PK": "Pakistan",
+    "PL": "Poland", "PR": "Puerto Rico", "PS": "Palestine", "PT": "Portugal",
+    "PY": "Paraguay", "QA": "Qatar", "RO": "Romania", "RS": "Serbia",
+    "RU": "Russia", "RW": "Rwanda", "SA": "Saudi Arabia", "SD": "Sudan",
+    "SE": "Sweden", "SG": "Singapore", "SI": "Slovenia", "SK": "Slovakia",
+    "SN": "Senegal", "SO": "Somalia", "SS": "South Sudan", "SV": "El Salvador",
+    "SY": "Syria", "TD": "Chad", "TG": "Togo", "TH": "Thailand",
+    "TJ": "Tajikistan", "TM": "Turkmenistan", "TN": "Tunisia", "TR": "Turkey",
+    "TW": "Taiwan", "TZ": "Tanzania", "UA": "Ukraine", "UG": "Uganda",
+    "UK": "United Kingdom", "US": "United States", "UY": "Uruguay",
+    "UZ": "Uzbekistan", "VE": "Venezuela", "VN": "Vietnam", "XK": "Kosovo",
+    "YE": "Yemen", "ZA": "South Africa", "ZW": "Zimbabwe",
+}
+
 PROTON_API_BASE      = "https://vpn-api.proton.me"
 CREDENTIALS_FILE     = WG_DIR / "proton_auth" / "credentials.json"
 CERT_REFRESH_AHEAD   = 48 * 3600  # refresh when fewer than 48 h remain
@@ -317,19 +358,32 @@ _cert_refresher = _CertRefresher()
 # index.json cache — loaded once at first use.
 _index_lock = threading.Lock()
 _index_cache: list | None = None
+_iface_city_map: dict | None = None  # stem → "_city:CC:City"
 
 
 def _load_index() -> list:
-    global _index_cache
+    global _index_cache, _iface_city_map
     with _index_lock:
         if _index_cache is None:
             try:
                 _index_cache = json.loads(INDEX_PATH.read_text()).get("servers", [])
+                _iface_city_map = {
+                    Path(s["path"]).stem: f"_city:{s['country']}:{s['city']}"
+                    for s in _index_cache
+                    if s.get("path") and s.get("country") and s.get("city")
+                }
                 logger.info("Loaded %d servers from index.json", len(_index_cache))
             except (OSError, json.JSONDecodeError) as exc:
                 logger.warning("Could not load index.json: %s", exc)
                 _index_cache = []
+                _iface_city_map = {}
         return _index_cache
+
+
+def _iface_to_city_code(iface: str) -> str | None:
+    """Return the _city:CC:City code for a WireGuard interface stem, or None."""
+    _load_index()
+    return (_iface_city_map or {}).get(iface)
 
 
 def _find_conf(stem: str) -> Path | None:
@@ -593,10 +647,11 @@ def status():
         loc = ", ".join(filter(None, [ipv6.get("city"), ipv6.get("country_code")]))
         fields["Public IPv6"] = f"{ipv6['ip']} ({loc})" if loc else ipv6["ip"]
 
+    city_code = _iface_to_city_code(iface) or iface
     return jsonify({
         "status": "Connected" if connected else "Disconnected",
         "server": iface,
-        "city_code": iface,
+        "city_code": city_code,
         "city": f"ProtonVPN ({iface})",
         "fields": fields,
         "details": raw,
@@ -724,14 +779,8 @@ def disconnect():
 
 @app.route("/api/v1/countries")
 def countries():
-    """List countries available in the index.json manifest."""
-    index = _load_index()
-    seen: set[str] = set()
-    for s in index:
-        cc = s.get("country", "")
-        if cc:
-            seen.add(cc)
-    return jsonify(sorted(seen))
+    """Return empty list — server list is presented as a flat Country - City dropdown."""
+    return jsonify([])
 
 
 @app.route("/api/v1/cities")
@@ -774,12 +823,26 @@ def cities():
 
 @app.route("/api/v1/servers")
 def servers():
-    """Return the curated root-level configs (IPv6-capable, no country filter needed)."""
-    confs = sorted(WG_DIR.glob("*.conf"))
-    return jsonify([
-        {"code": c.stem, "name": c.stem, "ipv6": _conf_has_ipv6(c)}
-        for c in confs
-    ])
+    """Return a flat Country - City list from the index, sorted alphabetically."""
+    index = _load_index()
+    seen: set[tuple] = set()
+    result = []
+    for s in index:
+        cc = s.get("country", "")
+        city = s.get("city", "")
+        if not cc or not city:
+            continue
+        key = (cc, city)
+        if key in seen:
+            continue
+        seen.add(key)
+        country_name = _CC_TO_NAME.get(cc, cc)
+        result.append({
+            "code": f"_city:{cc}:{city}",
+            "name": f"{country_name} - {city}",
+        })
+    result.sort(key=lambda x: x["name"])
+    return jsonify(result)
 
 
 @app.route("/api/v1/reload-cert", methods=["POST"])
