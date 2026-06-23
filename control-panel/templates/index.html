@@ -87,6 +87,7 @@
     let   pollTimer = null;
     let   _actionInFlight = false;
     let   _userChangedServer = false;  // true after user manually picks from dropdown
+    let   _statusFailures = 0;        // consecutive failed status polls
 
     // All fetch calls go through this so there's always a bounded timeout.
     // Without it, a briefly-unreachable backend leaves the spinner running forever.
@@ -305,11 +306,16 @@
 
         return timedFetch(backendApi('status' + (force ? '?refresh=1' : '')), {}, 8000)
             .then(response => response.json())
-            .then(renderStatus)
+            .then(data => { _statusFailures = 0; renderStatus(data); })
             .catch(err => {
-                const timedOut = err.name === 'AbortError';
-                console.warn('updateStatus ' + (timedOut ? 'timed out' : 'failed:'), err);
-                document.getElementById('statusText').textContent = 'Status: backend unreachable';
+                _statusFailures++;
+                console.warn('updateStatus failed (×' + _statusFailures + '):', err);
+                // Suppress the first failure — a VPN switch causes a brief routing
+                // disruption that clears on the next poll.  Only surface the error
+                // after two consecutive failures so transient blips stay invisible.
+                if (_statusFailures >= 2) {
+                    document.getElementById('statusText').textContent = 'Status: temporarily unavailable';
+                }
             })
             .finally(() => {
                 if (refreshBtn) refreshBtn.classList.remove('spinning');
