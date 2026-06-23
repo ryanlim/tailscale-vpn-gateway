@@ -10,6 +10,7 @@ import ssl
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -35,6 +36,11 @@ LOCAL_AGENT_HOST = "10.2.0.1"
 LOCAL_AGENT_PORT = 65432
 LOCAL_AGENT_CERT = WG_DIR / "proton_auth" / "client.pem"
 LOCAL_AGENT_KEY  = WG_DIR / "proton_auth" / "client.key"
+
+PROTON_API_BASE      = "https://vpn-api.proton.me"
+CREDENTIALS_FILE     = WG_DIR / "proton_auth" / "credentials.json"
+CERT_REFRESH_AHEAD   = 48 * 3600  # refresh when fewer than 48 h remain
+CERT_CHECK_INTERVAL  = 6 * 3600   # poll every 6 hours
 
 
 class _LocalAgent:
@@ -116,6 +122,197 @@ class _LocalAgent:
 
 
 _local_agent = _LocalAgent()
+
+
+class _CertRefresher:
+    """Background thread that refreshes the ProtonVPN client certificate before expiry.
+
+    Reads API credentials from proton_auth/credentials.json (written once by
+    extract_credentials.py on the host) and calls POST /vpn/v1/certificate when
+    fewer than 48 hours of validity remain.  Handles access-token expiry
+    transparently via /auth/refresh.  On success it overwrites client.pem and
+    restarts the local agent so the new cert takes effect without a container
+    restart or VPN reconnect.
+    """
+
+    def __init__(self):
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="cert-refresher")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # --- internal helpers ---
+
+    def _cert_seconds_remaining(self) -> float | None:
+        """Seconds until client cert expires, or None if the cert is unreadable."""
+        try:
+            r = subprocess.run(
+                ["openssl", "x509", "-noout", "-enddate", "-in", str(LOCAL_AGENT_CERT)],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode != 0:
+                return None
+            m = re.search(r"notAfter=(.+)", r.stdout)
+            if not m:
+                return None
+            expiry = datetime.strptime(m.group(1).strip(), "%b %d %H:%M:%S %Y %Z")
+            expiry = expiry.replace(tzinfo=timezone.utc)
+            return (expiry - datetime.now(timezone.utc)).total_seconds()
+        except Exception as exc:
+            logger.warning("cert-refresher: could not read cert expiry: %s", exc)
+            return None
+
+    def _load_creds(self) -> dict | None:
+        try:
+            return json.loads(CREDENTIALS_FILE.read_text())
+        except OSError:
+            return None  # not yet created — normal until extract_credentials.py runs
+        except Exception as exc:
+            logger.warning("cert-refresher: credentials.json unreadable: %s", exc)
+            return None
+
+    def _save_creds(self, creds: dict) -> None:
+        try:
+            CREDENTIALS_FILE.write_text(json.dumps(creds, indent=2))
+            CREDENTIALS_FILE.chmod(0o600)
+        except Exception as exc:
+            logger.warning("cert-refresher: could not write credentials.json: %s", exc)
+
+    def _api_headers(self, creds: dict) -> dict:
+        return {
+            "x-pm-appversion": creds.get("appversion", "Other"),
+            "User-Agent": creds.get("user_agent", "None"),
+            "x-pm-uid": creds["uid"],
+            "Authorization": f"Bearer {creds['access_token']}",
+        }
+
+    def _refresh_token(self, creds: dict) -> dict | None:
+        """Exchange the refresh token for a new access token. Returns updated creds or None."""
+        try:
+            r = requests.post(
+                f"{PROTON_API_BASE}/auth/refresh",
+                json={
+                    "ResponseType": "token",
+                    "GrantType": "refresh_token",
+                    "RefreshToken": creds["refresh_token"],
+                    "RedirectURI": "http://protonmail.ch",
+                },
+                headers={
+                    "x-pm-appversion": creds.get("appversion", "Other"),
+                    "User-Agent": creds.get("user_agent", "None"),
+                    "x-pm-uid": creds["uid"],
+                },
+                timeout=15,
+            )
+            if r.ok:
+                data = r.json()
+                creds = {**creds, "access_token": data["AccessToken"], "refresh_token": data["RefreshToken"]}
+                self._save_creds(creds)
+                logger.info("cert-refresher: access token refreshed")
+                return creds
+            logger.warning("cert-refresher: token refresh HTTP %s — re-run extract_credentials.py", r.status_code)
+        except Exception as exc:
+            logger.warning("cert-refresher: token refresh error: %s", exc)
+        return None
+
+    def _get_pubkey_pem(self) -> str | None:
+        """Derive Ed25519 public key PEM from client.key."""
+        try:
+            r = subprocess.run(
+                ["openssl", "pkey", "-in", str(LOCAL_AGENT_KEY), "-pubout"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except Exception as exc:
+            logger.warning("cert-refresher: could not derive public key: %s", exc)
+        return None
+
+    def _fetch_cert(self, creds: dict, pubkey_pem: str) -> tuple[str | None, dict]:
+        """POST /vpn/v1/certificate. Returns (cert_pem, updated_creds) or (None, creds)."""
+        body = {"ClientPublicKey": pubkey_pem, "Duration": "10080 min"}
+        for attempt in range(2):
+            try:
+                r = requests.post(
+                    f"{PROTON_API_BASE}/vpn/v1/certificate",
+                    json=body,
+                    headers=self._api_headers(creds),
+                    timeout=15,
+                )
+                if r.status_code == 401 and attempt == 0:
+                    logger.info("cert-refresher: access token expired, refreshing...")
+                    new_creds = self._refresh_token(creds)
+                    if new_creds is None:
+                        return None, creds
+                    creds = new_creds
+                    continue
+                if r.ok:
+                    cert_pem = r.json().get("Certificate")
+                    if cert_pem:
+                        return cert_pem, creds
+                    logger.warning("cert-refresher: API response missing 'Certificate' field")
+                    return None, creds
+                logger.warning("cert-refresher: cert fetch HTTP %s: %s", r.status_code, r.text[:200])
+                return None, creds
+            except Exception as exc:
+                logger.warning("cert-refresher: cert fetch error: %s", exc)
+                return None, creds
+        return None, creds
+
+    def _do_refresh(self) -> bool:
+        """Run one certificate refresh cycle. Returns True on success."""
+        creds = self._load_creds()
+        if creds is None:
+            logger.info("cert-refresher: credentials.json absent — skipping (run extract_credentials.py)")
+            return False
+        pubkey_pem = self._get_pubkey_pem()
+        if pubkey_pem is None:
+            return False
+        cert_pem, _creds = self._fetch_cert(creds, pubkey_pem)
+        if cert_pem is None:
+            return False
+        LOCAL_AGENT_CERT.write_text(cert_pem)
+        LOCAL_AGENT_CERT.chmod(0o600)
+        logger.info("cert-refresher: new certificate written to %s", LOCAL_AGENT_CERT)
+        _local_agent.start()
+        logger.info("cert-refresher: local agent restarted with new certificate")
+        return True
+
+    def _run(self) -> None:
+        self._stop.wait(30)  # brief startup delay
+        while not self._stop.is_set():
+            try:
+                remaining = self._cert_seconds_remaining()
+                if remaining is None:
+                    logger.debug("cert-refresher: cert not yet provisioned")
+                elif remaining < CERT_REFRESH_AHEAD:
+                    logger.info(
+                        "cert-refresher: %.0f h remaining — refreshing certificate",
+                        remaining / 3600,
+                    )
+                    if self._do_refresh():
+                        logger.info("cert-refresher: certificate refreshed successfully")
+                    else:
+                        logger.warning("cert-refresher: certificate refresh FAILED")
+                else:
+                    logger.info(
+                        "cert-refresher: %.1f days remaining — no refresh needed",
+                        remaining / 86400,
+                    )
+            except Exception as exc:
+                logger.warning("cert-refresher: unexpected error: %s", exc)
+            self._stop.wait(CERT_CHECK_INTERVAL)
+
+
+_cert_refresher = _CertRefresher()
 
 # index.json cache — loaded once at first use.
 _index_lock = threading.Lock()
@@ -585,6 +782,21 @@ def servers():
     ])
 
 
+@app.route("/api/v1/reload-cert", methods=["POST"])
+def reload_cert():
+    """Re-read the client certificate from disk and restart the local agent.
+
+    Called by refresh_cert.py after it writes a fresh certificate.  The local
+    agent thread is restarted so it picks up the new cert without requiring a
+    container restart or a VPN reconnect.
+    """
+    if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
+        return jsonify({"error": "cert files not found in proton_auth/"}), 404
+    _local_agent.start()
+    logger.info("reload-cert: local agent restarted with updated certificate")
+    return jsonify({"message": "local agent restarted with updated certificate"})
+
+
 @app.route("/api/v1/servers/refresh", methods=["POST"])
 def servers_refresh():
     return servers()
@@ -598,4 +810,5 @@ def public_ip():
 
 
 if __name__ == "__main__":
+    _cert_refresher.start()
     app.run(host="0.0.0.0", port=80, threaded=True)
