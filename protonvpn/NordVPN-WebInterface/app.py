@@ -418,29 +418,14 @@ def cities():
 
     result = []
     for city, data in city_map.items():
-        min_load = data["min_load"]
-        load_str = f"{min_load}%" if min_load is not None else "?"
         result.append({
             "code": f"_city:{country}:{city}",
-            "name": f"{city}  —  {load_str} min load, {data['count']} servers",
+            "name": f"{city}  ({data['count']} servers)",
             "city": city,
-            "min_load": min_load if min_load is not None else 999,
         })
-    result.sort(key=lambda x: x["min_load"])
+    result.sort(key=lambda x: x["city"])
     return jsonify(result)
 
-
-@app.route("/api/v1/index-info")
-def index_info():
-    """Return metadata about the local index.json (generation timestamp, count)."""
-    try:
-        raw = json.loads(INDEX_PATH.read_text())
-        return jsonify({
-            "generated": raw.get("generated"),
-            "server_count": len(raw.get("servers", [])),
-        })
-    except (OSError, json.JSONDecodeError):
-        return jsonify({"generated": None, "server_count": 0})
 
 
 @app.route("/api/v1/servers")

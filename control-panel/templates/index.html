@@ -68,7 +68,6 @@
                 <select class="form-select mb-2" id="serverSelect" name="server"></select>
                 <button class="btn btn-success w-100" type="submit" id="connectBtn">Connect to VPN</button>
             </form>
-            <p class="text-muted small mb-0 d-none" id="loadNote"></p>
 
             <!-- Disconnect -->
             <form onsubmit="handleSubmit(event, 'disconnect');">
@@ -290,8 +289,6 @@
     function loadServers(retryDelay = 2000) {
         if (!currentBackend) return;
         const callerBackend = currentBackend;
-        const loadNote = document.getElementById('loadNote');
-        loadNote.classList.add('d-none');
 
         fetch(backendApi('servers'))
             .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
@@ -318,8 +315,6 @@
     function loadCities(country) {
         if (!currentBackend) return;
         const callerBackend = currentBackend;
-        const loadNote = document.getElementById('loadNote');
-        loadNote.classList.add('d-none');
         setServerSelectPlaceholder('Loading cities…');
 
         fetch(backendApi('cities?country=' + encodeURIComponent(country)))
@@ -338,17 +333,6 @@
                 console.warn('loadCities failed:', err);
                 setServerSelectPlaceholder('Could not load cities');
             });
-
-        // Show the stale-load note and fetch timestamp from the backend.
-        fetch(backendApi('index-info'))
-            .then(r => r.ok ? r.json() : null)
-            .then(info => {
-                if (callerBackend !== currentBackend || !info) return;
-                const ts = info.generated ? new Date(info.generated).toLocaleString() : 'unknown';
-                loadNote.textContent = `Load values are from the last server download (${ts}). Re-run download_wg_configs.py to refresh.`;
-                loadNote.classList.remove('d-none');
-            })
-            .catch(() => {});
     }
 
     function loadCountries() {
@@ -390,7 +374,6 @@
         document.getElementById('backendSelect').value = name;
         document.getElementById('countryRow').classList.add('d-none');
         document.getElementById('countrySelect').innerHTML = '';
-        document.getElementById('loadNote').classList.add('d-none');
         setServerSelectPlaceholder('Loading server list…');
         document.getElementById('statusText').textContent = 'Status: …';
         updateConnectButton();
@@ -405,12 +388,8 @@
         document.getElementById('backendSelect').addEventListener('change', e => selectBackend(e.target.value));
         document.getElementById('countrySelect').addEventListener('change', () => {
             const country = document.getElementById('countrySelect').value;
-            if (country) {
-                loadCities(country);
-            } else {
-                document.getElementById('loadNote').classList.add('d-none');
-                loadServers();
-            }
+            if (country) loadCities(country);
+            else loadServers();
         });
         document.getElementById('serverSelect').addEventListener('change', updateConnectButton);
         document.getElementById('setActiveBtn').addEventListener('click', setActiveBackend);
