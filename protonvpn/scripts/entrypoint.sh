@@ -1,7 +1,14 @@
 #!/bin/sh
 set -e
 
-WG_CONF=${WG_CONF:-/etc/wireguard/free-us-8.conf}
+if [ -z "$WG_CONF" ] || [ ! -f "$WG_CONF" ]; then
+    WG_CONF=$(find /etc/wireguard -name "*.conf" | sort | head -1)
+    if [ -z "$WG_CONF" ]; then
+        echo "ERROR: No WireGuard configs found in /etc/wireguard and WG_CONF is not set"
+        exit 1
+    fi
+    echo "WG_CONF not set or missing, using $WG_CONF"
+fi
 WG_IFACE=$(basename "$WG_CONF" .conf)
 ACTIVE_IFACE_FILE=/tmp/active_wg_iface
 EGRESS_CHECK_INTERVAL=${EGRESS_CHECK_INTERVAL:-60}

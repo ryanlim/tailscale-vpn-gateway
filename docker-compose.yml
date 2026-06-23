@@ -159,7 +159,7 @@ services:
       - net.ipv6.conf.all.forwarding=1
     environment:
       - INSTANCE_NAME=${INSTANCE_NAME}
-      - WG_CONF=/etc/wireguard/free-us-8.conf
+      - WG_CONF=${PROTONVPN_WG_CONF:-/etc/wireguard/US/San_Jose/us-ca_10.conf}
     volumes:
       - "/dev/net/tun:/dev/net/tun"
       - "/lib/modules:/lib/modules:ro"
