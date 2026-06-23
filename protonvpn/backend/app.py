@@ -96,6 +96,7 @@ class _LocalAgent:
     def __init__(self):
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._raw: socket.socket | None = None  # closed by stop() to interrupt recv
 
     def start(self) -> None:
         if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
@@ -107,8 +108,14 @@ class _LocalAgent:
 
     def stop(self) -> None:
         self._stop.set()
+        raw = self._raw
+        if raw is not None:
+            try:
+                raw.close()  # interrupts any blocking recv() on the TLS wrapper
+            except OSError:
+                pass
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=1)
         self._thread = None
 
     def _make_ctx(self) -> ssl.SSLContext:
@@ -126,6 +133,7 @@ class _LocalAgent:
                 with socket.create_connection(
                     (LOCAL_AGENT_HOST, LOCAL_AGENT_PORT), timeout=10
                 ) as raw:
+                    self._raw = raw
                     with ctx.wrap_socket(raw, server_hostname=LOCAL_AGENT_HOST) as s:
                         s.settimeout(5)
                         data = s.recv(4096)
@@ -141,15 +149,12 @@ class _LocalAgent:
                                     desc = err.get("description", "unknown")
                                     logger.warning("Local agent rejected (code %s): %s", code, desc)
                                     if code == 86202:
-                                        # WireGuard key doesn't match certificate —
-                                        # permanent config error, no point retrying.
                                         return
                             except (json.JSONDecodeError, KeyError):
                                 pass
 
-                        # Keep connection alive until stopped or server closes it.
+                        s.settimeout(1)
                         while not self._stop.is_set():
-                            s.settimeout(5)
                             try:
                                 chunk = s.recv(4096)
                                 if not chunk:
@@ -160,6 +165,8 @@ class _LocalAgent:
                 if not self._stop.is_set():
                     logger.debug("Local agent connection failed: %s", exc)
                     self._stop.wait(10)
+            finally:
+                self._raw = None
 
 
 _local_agent = _LocalAgent()
@@ -597,18 +604,23 @@ def _status_fields(raw: str, iface: str) -> dict:
 
 
 def _fetch_public_ip(family: int) -> dict | None:
-    url = "https://ipinfo.io/json" if family == 4 else "https://v6.ipinfo.io/json"
+    url = "https://ip.limau.net/?format=json" if family == 4 else "https://ip6.limau.net/?format=json"
     try:
         r = requests.get(url, timeout=6)
         if r.ok:
-            d = r.json()
+            candidates = r.json().get("ip_candidates", [])
+            if not candidates:
+                return None
+            c = candidates[0]
+            geo = c.get("geoip_data") or {}
+            asn = c.get("ip_asn") or []
             return {
-                "ip": d.get("ip"),
-                "hostname": d.get("hostname"),
-                "city": d.get("city"),
-                "region": d.get("region"),
-                "country_code": d.get("country"),
-                "asn": d.get("org"),
+                "ip": c.get("ip"),
+                "hostname": c.get("hostname"),
+                "city": geo.get("city"),
+                "region": geo.get("region"),
+                "country_code": geo.get("country_code"),
+                "asn": " ".join(asn) if asn else None,
             }
     except requests.RequestException:
         pass
@@ -739,11 +751,7 @@ def connect():
         if current == iface:
             return jsonify({"message": f"Already connected to {iface}", "output": ""})
 
-        # Pin management routes BEFORE wg-quick touches the routing table so
-        # Tailscale and the Docker bridge stay reachable through the transition.
         _exempt_management_add()
-
-        # Remove masquerade rule for the outgoing interface.
         _masquerade_update(current, None)
         try:
             _wg_down(current)
@@ -756,8 +764,6 @@ def connect():
                 check=True, capture_output=True, text=True, timeout=30,
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            # New VPN failed. Restore previous connection so the container
-            # isn't left stranded without a working exit path.
             _exempt_management_del()
             prev_conf = _find_conf(current)
             if prev_conf and prev_conf.exists():
@@ -770,35 +776,17 @@ def connect():
                     _masquerade_update(None, current, _conf_has_ipv6(prev_conf))
                     ACTIVE_IFACE_FILE.write_text(current)
                 finally:
-                    # Always remove management rules — leaving them breaks routing
-                    # (pref-99 "from eth0-subnet table main" overrides WireGuard).
                     _exempt_management_del()
             err = getattr(exc, 'stderr', None) or 'wg-quick timed out'
             return jsonify({"error": f"wg-quick up failed: {err}"}), 500
 
-        # Remove management exemption rules now that the new tunnel is up.
-        # They must not persist: the pref-99 "from <eth0-subnet> table main" rule
-        # overrides wg-quick's pref-32765 rule and sends all outbound traffic
-        # through the Docker bridge instead of the WireGuard tunnel.
         _exempt_management_del()
 
-        # Wait for the WireGuard handshake with the new server before returning.
-        # wg-quick up exits as soon as the interface is configured; the actual
-        # handshake with the peer happens asynchronously and takes 1–3 seconds.
-        # Returning before the handshake means the caller sees "Connected" while
-        # traffic is still being dropped by the peer.
         if not _wait_for_handshake(iface):
             logger.warning("No WireGuard handshake within 10s for %s", iface)
 
-        # Authenticate with the ProtonVPN local agent (10.2.0.1:65432) so that
-        # paid servers release the session from "jailed" (no egress) to "connected".
         _local_agent.start()
 
-        # Re-add masquerade for the new interface. wg-quick silently skips iptables
-        # in Docker (src_valid_mark sysctl is read-only), so we do it explicitly.
-        # Only add ip6tables rule if the new config actually has an IPv6 address —
-        # configs downloaded without --ipv6 have no IPv6 interface address and
-        # MASQUERADE would have no valid source.
         _masquerade_update(None, iface, _conf_has_ipv6(conf))
         ACTIVE_IFACE_FILE.write_text(iface)
         return jsonify({"message": f"Connected to {target}", "output": result.stdout})
