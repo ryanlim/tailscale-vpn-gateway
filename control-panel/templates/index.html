@@ -86,6 +86,7 @@
     let   lastStatus = null;  // most recent /status response, drives connect-button state
     let   pollTimer = null;
     let   _actionInFlight = false;
+    let   _userChangedServer = false;  // true after user manually picks from dropdown
 
     // All fetch calls go through this so there's always a bounded timeout.
     // Without it, a briefly-unreachable backend leaves the spinner running forever.
@@ -193,6 +194,7 @@
                 showToast('Error: ' + msg, true);
             })
             .finally(() => {
+                _userChangedServer = false;  // allow next renderStatus to sync the dropdown
                 setActionInFlight(false);
                 updateStatus();
             });
@@ -214,6 +216,15 @@
         ['Public IPv4',      'Public IPv4'],
         ['Public IPv6',      'Public IPv6'],
     ];
+
+    // Sync the server dropdown to cityCode, but only when a matching option exists
+    // and the user hasn't made a manual selection since the last connect/load.
+    function syncDropdown(cityCode) {
+        if (!cityCode || _userChangedServer) return;
+        const sel = document.getElementById('serverSelect');
+        const match = Array.from(sel.options).find(o => o.value === cityCode);
+        if (match) sel.value = cityCode;
+    }
 
     function renderStatus(data) {
         lastStatus = data;
@@ -250,6 +261,7 @@
         statusTable.classList.toggle('d-none', tbody.children.length === 0);
 
         statusText.textContent = `Status: ${data.status}`;
+        syncDropdown(data.city_code);
         updateConnectButton();
     }
 
@@ -333,13 +345,14 @@
                 if (callerBackend !== currentBackend) return;
                 if (!Array.isArray(servers)) throw new Error('bad response');
                 fillSelect(document.getElementById('serverSelect'), servers);
-                fetch(backendApi('status'))
+                timedFetch(backendApi('status'), {}, 8000)
                     .then(r => r.json())
                     .then(data => {
                         if (callerBackend !== currentBackend) return;
-                        if (data.city_code) document.getElementById('serverSelect').value = data.city_code;
+                        syncDropdown(data.city_code);
                         updateConnectButton();
-                    });
+                    })
+                    .catch(() => {});
             })
             .catch(err => {
                 if (callerBackend !== currentBackend) return;
@@ -428,7 +441,10 @@
             if (country) loadCities(country);
             else loadServers();
         });
-        document.getElementById('serverSelect').addEventListener('change', updateConnectButton);
+        document.getElementById('serverSelect').addEventListener('change', () => {
+            _userChangedServer = true;
+            updateConnectButton();
+        });
         document.getElementById('setActiveBtn').addEventListener('click', setActiveBackend);
 
         // Fetch backend list and active-backend in parallel so that on cold
