@@ -89,6 +89,7 @@
     let   _userChangedServer = false;  // true after user manually picks from dropdown
     let   _statusFailures = 0;        // consecutive failed status polls
     let   _ipRefreshInProgress = false;
+    let   _lastConnectTime = 0;       // ms timestamp of last connect/disconnect attempt
 
     // All fetch calls go through this so there's always a bounded timeout.
     // Without it, a briefly-unreachable backend leaves the spinner running forever.
@@ -167,6 +168,7 @@
         if (!currentBackend || _actionInFlight) return;
 
         const label = action === 'connect' ? 'Connecting…' : 'Disconnecting…';
+        _lastConnectTime = Date.now();
         setActionInFlight(true, label);
 
         let options;
@@ -352,10 +354,12 @@
             .catch(err => {
                 _statusFailures++;
                 console.warn('updateStatus failed (×' + _statusFailures + '):', err);
-                // Suppress the first failure — a VPN switch causes a brief routing
-                // disruption that clears on the next poll.  Only surface the error
-                // after two consecutive failures so transient blips stay invisible.
-                if (_statusFailures >= 2) {
+                // Suppress errors for 20 s after a connect/disconnect — the VPN
+                // tunnel swap briefly disrupts the exit-node path, causing rapid
+                // poll failures that clear on their own.  Outside the grace period,
+                // require two consecutive failures before surfacing anything.
+                const inGracePeriod = (Date.now() - _lastConnectTime) < 20000;
+                if (!inGracePeriod && _statusFailures >= 2) {
                     document.getElementById('statusText').textContent = 'Status: temporarily unavailable';
                 }
             })
