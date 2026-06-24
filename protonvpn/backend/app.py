@@ -426,6 +426,33 @@ _lock = threading.Lock()
 _ip_cache: dict = {"v4": None, "v6": None, "ts": 0.0}
 _ip_refresh_event = threading.Event()  # set to trigger an immediate background refresh
 
+# Timestamp (time.time()) when the current WireGuard tunnel came up.
+# Initialised from ACTIVE_IFACE_FILE mtime so container restarts don't
+# reset the displayed uptime; updated by connect(), cleared by disconnect().
+def _load_connect_time() -> float:
+    try:
+        if ACTIVE_IFACE_FILE.read_text().strip():
+            return ACTIVE_IFACE_FILE.stat().st_mtime
+    except OSError:
+        pass
+    return 0.0
+
+_connect_time: float = _load_connect_time()
+
+
+def _uptime_str(since: float) -> str:
+    secs = max(0, int(time.time() - since))
+    d, secs = divmod(secs, 86400)
+    h, secs = divmod(secs, 3600)
+    m, s   = divmod(secs, 60)
+    parts = []
+    if d: parts.append(f"{d}d")
+    if h: parts.append(f"{h}h")
+    if m: parts.append(f"{m}m")
+    if not parts or s:
+        parts.append(f"{s}s")
+    return " ".join(parts)
+
 
 def _eth0_subnet() -> str | None:
     """Return the IPv4 subnet of eth0 (the Docker bridge), e.g. 172.18.0.0/24."""
@@ -700,6 +727,9 @@ def status():
     connected = _is_connected(raw)
     fields = _status_fields(raw, iface) if connected else {"Technology": "WireGuard", "Interface": iface}
 
+    if connected and _connect_time > 0:
+        fields["Uptime"] = _uptime_str(_connect_time)
+
     ipv4, ipv6 = _get_public_ips(refresh=refresh)
     if ipv4 and ipv4.get("ip"):
         loc = ", ".join(filter(None, [ipv4.get("city"), ipv4.get("country_code")]))
@@ -795,6 +825,8 @@ def connect():
 
         # Apply masquerade and record the active iface immediately so the status
         # endpoint reflects the new server without waiting for the handshake.
+        global _connect_time
+        _connect_time = time.time()
         _masquerade_update(None, iface, _conf_has_ipv6(conf))
         ACTIVE_IFACE_FILE.write_text(iface)
 
@@ -830,6 +862,8 @@ def disconnect():
             # Clear the active interface record so a subsequent connect() that
             # randomly picks the same interface name does not short-circuit with
             # "Already connected" while the tunnel is actually down.
+            global _connect_time
+            _connect_time = 0.0
             ACTIVE_IFACE_FILE.write_text("")
             return jsonify({"message": f"Disconnected from {iface}", "output": result.stdout})
         except subprocess.CalledProcessError as exc:
