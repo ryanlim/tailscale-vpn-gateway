@@ -1,8 +1,8 @@
-# tailscale-vpn
+# tailscale-vpn-gateway
 
 A dockerized Tailscale exit node that egresses through one or more VPN
-backends (NordVPN today, others to follow), fronted by a small web
-control panel reachable over your tailnet.
+backends (NordVPN and ProtonVPN, with more to follow), fronted by a small
+web control panel reachable over your tailnet.
 
 ## Architecture
 
@@ -28,15 +28,16 @@ control panel reachable over your tailnet.
 
 The current backends are:
 
-| Backend       | Status     | How it connects                          |
-|---------------|------------|------------------------------------------|
-| `nordvpn-wg`  | active     | NordVPN's WireGuard (NordLynx)           |
-| `nordvpn`     | maintained | NordVPN's official CLI (OpenVPN/NordLynx)|
+| Backend       | Status     | How it connects                           |
+|---------------|------------|-------------------------------------------|
+| `nordvpn-wg`  | active     | NordVPN's WireGuard (NordLynx)            |
+| `protonvpn`   | active     | ProtonVPN's WireGuard configs             |
+| `nordvpn`     | maintained | NordVPN's official CLI (OpenVPN/NordLynx) |
 
 ## Requirements
 
 - A docker host with `docker compose`.
-- A NordVPN account (token).
+- A VPN subscription — NordVPN (access token) and/or ProtonVPN (account credentials).
 - A tailnet (official Tailscale, or your own headscale).
 
 ## Quick start
@@ -72,6 +73,11 @@ expected; see *TLS* below).
 | `NORDVPN_RECONNECT_AFTER_HOURS`| Backend rotates to a fresh server on this cadence. |
 | `NORDVPN_TECHNOLOGY` / `NORDVPN_OPENVPN_PROTOCOL` | Only used by the legacy `nordvpn` backend. |
 
+ProtonVPN credentials are not stored in `.env`. Instead, use the **Log in**
+button in the control panel to authenticate with your ProtonVPN account over
+SRP. Credentials are persisted inside the container's bind-mounted volume and
+refreshed automatically.
+
 ### `control-panel/config/backends.json`
 
 The panel discovers backends from this file. Entries are arbitrary —
@@ -81,8 +87,9 @@ v1 API contract.
 ```json
 {
   "backends": [
-    { "name": "wg-us",  "label": "NordVPN-WG (US)",  "url": "http://ts-nordvpn-vpn-generic-wg:80" },
-    { "name": "wg-uk",  "label": "NordVPN-WG (UK)",  "url": "http://ts-nordvpn-vpn-generic-wg-uk:80" }
+    { "name": "wg-us",     "label": "NordVPN-WG (US)",  "url": "http://ts-nordvpn-vpn-generic-wg:80" },
+    { "name": "wg-uk",     "label": "NordVPN-WG (UK)",  "url": "http://ts-nordvpn-vpn-generic-wg-uk:80" },
+    { "name": "protonvpn", "label": "ProtonVPN",         "url": "http://ts-protonvpn-vpn-generic-wg:80" }
   ]
 }
 ```
