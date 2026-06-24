@@ -65,6 +65,13 @@
 
             <!-- Server selector + connect -->
             <form class="mb-2" onsubmit="handleSubmit(event, 'connect');">
+                <div class="d-flex align-items-center mb-1" id="serverLabelRow">
+                    <label for="serverSelect" class="form-label text-muted small mb-0 me-auto">Server</label>
+                    <button type="button" class="refresh-btn" id="configRefreshBtn"
+                            title="Re-download configs from Proton" aria-label="Refresh server configs"
+                            onclick="refreshServerConfigs()">↻</button>
+                    <span id="configRefreshMsg" class="text-muted small ms-1" style="font-size:.75rem"></span>
+                </div>
                 <select class="form-select mb-2" id="serverSelect" name="server"></select>
                 <button class="btn btn-success w-100" type="submit" id="connectBtn">Connect to VPN</button>
             </form>
@@ -74,6 +81,63 @@
                 <button class="btn btn-danger w-100" type="submit" id="disconnectBtn">Disconnect from VPN</button>
             </form>
 
+            <!-- ProtonVPN credential management (hidden for non-ProtonVPN backends) -->
+            <div id="credentialSection" class="d-none">
+                <hr class="my-3">
+                <!-- Re-login prompt shown when status is warning or error -->
+                <div id="credBanner" class="alert py-2 d-none d-flex align-items-center gap-2 mb-2" role="alert">
+                    <span id="credBannerText" class="flex-grow-1 small"></span>
+                    <button type="button" class="btn btn-sm btn-outline-dark text-nowrap"
+                            onclick="showLoginModal()">Log in</button>
+                </div>
+                <!-- Status row -->
+                <div class="d-flex justify-content-between align-items-center">
+                    <small class="text-muted">Credentials</small>
+                    <div class="d-flex align-items-center gap-2">
+                        <span id="credBadge" class="badge bg-secondary">—</span>
+                        <button type="button" class="btn btn-outline-secondary btn-sm"
+                                onclick="showLoginModal()">Re-authenticate</button>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- ProtonVPN Login Modal -->
+    <div class="modal fade" id="loginModal" tabindex="-1" aria-labelledby="loginModalLabel" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header border-0 pb-0">
+                    <h5 class="modal-title fw-light" id="loginModalLabel">ProtonVPN Login</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <!-- Step 1: credentials -->
+                    <div id="loginStep1">
+                        <div class="mb-3">
+                            <label for="loginUsername" class="form-label small text-muted mb-1">Username</label>
+                            <input type="text" class="form-control" id="loginUsername" autocomplete="username">
+                        </div>
+                        <div class="mb-0">
+                            <label for="loginPassword" class="form-label small text-muted mb-1">Password</label>
+                            <input type="password" class="form-control" id="loginPassword" autocomplete="current-password">
+                        </div>
+                    </div>
+                    <!-- Step 2: 2FA (shown after successful SRP when account has TOTP) -->
+                    <div id="loginStep2" class="d-none">
+                        <p class="text-muted small mb-2">Enter your authenticator code.</p>
+                        <input type="text" class="form-control text-center font-monospace fs-4 letter-spacing-wide"
+                               id="loginTotp" placeholder="000 000" maxlength="6" autocomplete="one-time-code"
+                               inputmode="numeric">
+                    </div>
+                    <div id="loginError" class="alert alert-danger py-2 small d-none mt-3 mb-0"></div>
+                </div>
+                <div class="modal-footer border-0 pt-0">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="button" class="btn btn-primary" id="loginBtn">Log in</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -90,6 +154,8 @@
     let   _statusFailures = 0;        // consecutive failed status polls
     let   _ipRefreshInProgress = false;
     let   _lastConnectTime = 0;       // ms timestamp of last connect/disconnect attempt
+    let   _credSessionToken = null;   // pending 2FA session token
+    let   _loginModalAutoShown = false; // don't re-open after user dismisses
 
     // All fetch calls go through this so there's always a bounded timeout.
     // Without it, a briefly-unreachable backend leaves the spinner running forever.
@@ -470,6 +536,65 @@
             });
     }
 
+    // --- Credential management (ProtonVPN only) ---
+
+    function updateCredentialStatus() {
+        if (!currentBackend) return;
+        timedFetch(backendApi('proton/credential-status'), {}, 8000)
+            .then(r => {
+                if (r.status === 404) throw new Error('not supported');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.json();
+            })
+            .then(data => {
+                const section = document.getElementById('credentialSection');
+                const badge   = document.getElementById('credBadge');
+                const banner  = document.getElementById('credBanner');
+                const bannerText = document.getElementById('credBannerText');
+
+                section.classList.remove('d-none');
+
+                const STATUS_MAP = {
+                    ok:      ['bg-success', 'OK'],
+                    warning: ['bg-warning text-dark', 'Warning'],
+                    error:   ['bg-danger', 'Error'],
+                };
+                const [cls, label] = STATUS_MAP[data.status] || ['bg-secondary', data.status];
+                badge.className = 'badge ' + cls;
+                badge.textContent = label;
+
+                if (data.status === 'ok') {
+                    banner.classList.add('d-none');
+                } else {
+                    const alertCls = data.status === 'error' ? 'alert-danger' : 'alert-warning';
+                    banner.className = 'alert ' + alertCls + ' py-2 d-flex align-items-center gap-2 mb-2';
+                    bannerText.textContent = data.message || '';
+                    banner.classList.remove('d-none');
+                    if (!_loginModalAutoShown) {
+                        _loginModalAutoShown = true;
+                        showLoginModal();
+                    }
+                }
+            })
+            .catch(() => {
+                // Backend doesn't expose this endpoint — hide section silently
+                document.getElementById('credentialSection').classList.add('d-none');
+            });
+    }
+
+    function showLoginModal() {
+        _credSessionToken = null;
+        document.getElementById('loginStep1').classList.remove('d-none');
+        document.getElementById('loginStep2').classList.add('d-none');
+        document.getElementById('loginUsername').value = '';
+        document.getElementById('loginPassword').value = '';
+        document.getElementById('loginTotp').value = '';
+        document.getElementById('loginError').classList.add('d-none');
+        document.getElementById('loginBtn').textContent = 'Log in';
+        document.getElementById('loginBtn').disabled = false;
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('loginModal')).show();
+    }
+
     function selectBackend(name) {
         currentBackend = name;
         lastStatus = null;
@@ -479,11 +604,15 @@
         document.getElementById('countrySelect').innerHTML = '';
         setServerSelectPlaceholder('Loading server list…');
         document.getElementById('statusText').textContent = 'Status: …';
+        document.getElementById('credentialSection').classList.add('d-none');
+        document.getElementById('credBanner').classList.add('d-none');
+        _loginModalAutoShown = false;
         updateConnectButton();
         updateActiveBtn();
         updateStatus();
         loadCountries();
         loadServers();
+        updateCredentialStatus();
     }
 
     document.addEventListener('DOMContentLoaded', () => {
@@ -535,6 +664,142 @@
         });
 
         pollTimer = setInterval(updateStatus, 10000);
+
+        // Login modal submit
+        document.getElementById('loginBtn').addEventListener('click', () => {
+            const errDiv = document.getElementById('loginError');
+            const btn    = document.getElementById('loginBtn');
+            errDiv.classList.add('d-none');
+            btn.disabled = true;
+
+            if (_credSessionToken) {
+                // Step 2: submit TOTP
+                const totp = document.getElementById('loginTotp').value.replace(/\s/g, '');
+                if (!totp) {
+                    errDiv.textContent = 'Enter the authenticator code.';
+                    errDiv.classList.remove('d-none');
+                    btn.disabled = false;
+                    return;
+                }
+                btn.textContent = 'Verifying…';
+                timedFetch(backendApi('proton/login/2fa'), {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({session_token: _credSessionToken, totp}),
+                }, 20000)
+                .then(r => r.json().then(d => ({ok: r.ok, d})))
+                .then(({ok, d}) => {
+                    if (ok) {
+                        bootstrap.Modal.getInstance(document.getElementById('loginModal')).hide();
+                        showToast('Logged in. Certificate refresh triggered.');
+                        setTimeout(updateCredentialStatus, 6000);
+                    } else {
+                        errDiv.textContent = d.error || '2FA verification failed.';
+                        errDiv.classList.remove('d-none');
+                    }
+                })
+                .catch(err => { errDiv.textContent = 'Error: ' + err.message; errDiv.classList.remove('d-none'); })
+                .finally(() => { btn.disabled = false; btn.textContent = 'Verify'; });
+
+            } else {
+                // Step 1: submit username + password
+                const username = document.getElementById('loginUsername').value.trim();
+                const password = document.getElementById('loginPassword').value;
+                if (!username || !password) {
+                    errDiv.textContent = 'Enter your username and password.';
+                    errDiv.classList.remove('d-none');
+                    btn.disabled = false;
+                    return;
+                }
+                btn.textContent = 'Logging in…';
+                timedFetch(backendApi('proton/login'), {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({username, password}),
+                }, 30000)
+                .then(r => r.json().then(d => ({ok: r.ok, d})))
+                .then(({ok, d}) => {
+                    if (ok && d.needs_2fa) {
+                        _credSessionToken = d.session_token;
+                        document.getElementById('loginStep1').classList.add('d-none');
+                        document.getElementById('loginStep2').classList.remove('d-none');
+                        btn.textContent = 'Verify';
+                        btn.disabled = false;
+                        document.getElementById('loginTotp').focus();
+                    } else if (ok) {
+                        bootstrap.Modal.getInstance(document.getElementById('loginModal')).hide();
+                        showToast('Logged in. Certificate refresh triggered.');
+                        setTimeout(updateCredentialStatus, 6000);
+                    } else {
+                        errDiv.textContent = d.error || 'Login failed.';
+                        errDiv.classList.remove('d-none');
+                        btn.disabled = false;
+                        btn.textContent = 'Log in';
+                    }
+                })
+                .catch(err => {
+                    errDiv.textContent = 'Error: ' + err.message;
+                    errDiv.classList.remove('d-none');
+                    btn.disabled = false;
+                    btn.textContent = 'Log in';
+                });
+            }
+        });
+
+        // Config refresh (re-download WireGuard configs from Proton)
+        window.refreshServerConfigs = function() {
+            const btn = document.getElementById('configRefreshBtn');
+            const msg = document.getElementById('configRefreshMsg');
+            if (!currentBackend || btn.classList.contains('spinning')) return;
+
+            btn.classList.add('spinning');
+            msg.textContent = 'Starting…';
+
+            timedFetch(backendApi('servers/refresh'), {method: 'POST'}, 8000)
+                .then(r => r.json().then(d => ({ok: r.ok, d})))
+                .then(({ok, d}) => {
+                    if (!ok && d.error) {
+                        btn.classList.remove('spinning');
+                        msg.textContent = d.error;
+                        return;
+                    }
+                    // Poll until done
+                    (function poll() {
+                        timedFetch(backendApi('servers/refresh/status'), {}, 8000)
+                            .then(r => r.json())
+                            .then(s => {
+                                if (s.state === 'running') {
+                                    msg.textContent = s.message || 'Running…';
+                                    setTimeout(poll, 2000);
+                                } else if (s.state === 'done') {
+                                    btn.classList.remove('spinning');
+                                    msg.textContent = 'Done ✓';
+                                    setTimeout(() => { msg.textContent = ''; }, 5000);
+                                    loadServers();
+                                } else {
+                                    btn.classList.remove('spinning');
+                                    msg.textContent = 'Error: ' + (s.message || s.state);
+                                }
+                            })
+                            .catch(() => {
+                                btn.classList.remove('spinning');
+                                msg.textContent = 'Poll error';
+                            });
+                    })();
+                })
+                .catch(err => {
+                    btn.classList.remove('spinning');
+                    msg.textContent = 'Error: ' + err.message;
+                });
+        };
+
+        // Allow Enter key in TOTP field to trigger login
+        document.getElementById('loginTotp').addEventListener('keydown', e => {
+            if (e.key === 'Enter') document.getElementById('loginBtn').click();
+        });
+        document.getElementById('loginPassword').addEventListener('keydown', e => {
+            if (e.key === 'Enter') document.getElementById('loginBtn').click();
+        });
     });
 </script>
 </body>

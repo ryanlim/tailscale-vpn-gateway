@@ -112,30 +112,30 @@ FEATURES = {
 
 # ---------------------------------------------------------------------------
 # Proton SRP authentication
-# Based on the Proton SRP protocol (RFC 5054 variant with SHA-512 + bcrypt)
+# Proton SRP — heavily modified SRP-6a variant
+# Sources: proton/session/srp/_pysrp.py and util.py (proton-python-client package)
+# ---------------------------------------------------------------------------
+#
+# Key differences from standard SRP-6a:
+#   - PMHash: SHA512(data+\x00) ‖ SHA512(data+\x01) ‖ SHA512(data+\x02) ‖ SHA512(data+\x03)
+#     → 256-byte digest (NOT plain SHA-512)
+#   - Salt padding: (salt + b"proton")[:16]  — literal "proton", NOT zero bytes
+#   - Password hash: PMHash(bcrypt(pw, padded_salt) | modulus)  — modulus is included!
+#   - k = PMHash(g_256le | N_256le)  — g first (as full 256 bytes), then N
+#   - K = S as raw 256-byte LE  (no hashing of S)
+#   - M1 = PMHash(A | B | K)  — no username/salt/XOR in the proof
 # ---------------------------------------------------------------------------
 
-# bcrypt base64 uses the same bit grouping as standard base64 but a different
-# character alphabet.  A simple character translation is sufficient.
-_STD_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-_BCR_B64 = "./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-_TO_BCR  = str.maketrans(_STD_B64, _BCR_B64)
+_STD_B64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+_BCR_B64 = b"./ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+_TO_BCR  = bytes.maketrans(_STD_B64, _BCR_B64)
 
 _PM_MOD_SIZE = 256  # 2048-bit modulus = 256 bytes
 
 
-def _make_bcrypt_salt(raw: bytes) -> bytes:
-    """
-    Build a 29-byte bcrypt salt string ($2y$10$<22 chars>) from raw bytes.
-    Bcrypt needs exactly 16 bytes of entropy; pad or truncate as needed.
-    """
-    padded  = (raw + b"\x00" * 16)[:16]                       # always 16 bytes
-    encoded = base64.b64encode(padded).decode().rstrip("=")    # 22 chars, no padding
-    return b"$2y$10$" + encoded.translate(_TO_BCR).encode()    # 29 bytes total
-
-
-def _H(*parts: bytes) -> bytes:
-    return hashlib.sha512(b"".join(parts)).digest()
+def _pmhash(data: bytes) -> bytes:
+    """Proton's custom 256-byte hash function (PMHash)."""
+    return b"".join(hashlib.sha512(data + bytes([i])).digest() for i in range(4))
 
 
 def _to_int(b: bytes) -> int:
@@ -160,24 +160,22 @@ def _strip_pgp_modulus(signed: str) -> bytes:
     return base64.b64decode("".join(body))
 
 
-def _hash_password(password: str, salt_bytes: bytes, version: int) -> bytes:
-    """Hash the user's password according to the SRP version sent by the server."""
+def _hash_password(password: str, salt_bytes: bytes, modulus: bytes, version: int) -> bytes:
+    """Proton v4 password hash: PMHash(bcrypt(pw, (salt+b'proton')[:16]) | modulus)."""
     if version >= 4:
         if _bcrypt is None:
             print("Error: 'bcrypt' required for ProtonVPN auth.  pip install bcrypt")
             sys.exit(1)
-        bcrypt_salt = _make_bcrypt_salt(salt_bytes)
+        padded = (salt_bytes + b"proton")[:16]
+        bcrypt_b64 = base64.b64encode(padded).translate(_TO_BCR)[:22]
+        bcrypt_salt = b"$2y$10$" + bcrypt_b64
         try:
-            return _bcrypt.hashpw(password.encode("utf-8"), bcrypt_salt)
+            hashed = _bcrypt.hashpw(password.encode("utf-8")[:72], bcrypt_salt)
         except ValueError as exc:
-            print(
-                f"bcrypt failed ({exc}).\n"
-                f"  salt_bytes length : {len(salt_bytes)}\n"
-                f"  bcrypt_salt       : {bcrypt_salt!r}\n"
-                f"  bcrypt version    : {getattr(_bcrypt, '__version__', 'unknown')}"
-            )
+            print(f"bcrypt failed ({exc}); bcrypt_salt={bcrypt_salt!r}")
             sys.exit(1)
-    # Version < 4: no bcrypt (legacy accounts)
+        return _pmhash(hashed + modulus)
+    # Version < 4: no bcrypt (legacy accounts not supported since 2018)
     return password.encode("utf-8")
 
 
@@ -186,30 +184,34 @@ def _srp_proofs(
     server_ephemeral: bytes,
     salt: bytes,
     hashed_pw: bytes,
-    username: str,
 ) -> tuple[bytes, bytes]:
     """
-    Compute SRP-6a client ephemeral (A) and proof (M1).
-    Uses little-endian byte order and SHA-512, as per Proton's protocol.
+    Compute SRP client ephemeral (A) and proof (M1).
+    hashed_pw is the output of _hash_password() — a 256-byte PMHash digest.
+    Returns (A_bytes, M1_bytes).
     """
     N = _to_int(modulus)
     g = 2
 
-    k = _to_int(_H(_to_bytes(N), _to_bytes(g, 1)))
+    # k = PMHash(g_256le | N_256le) — g as full 256 bytes, g before N
+    k = _to_int(_pmhash(_to_bytes(g) + modulus))
 
-    a = _to_int(os.urandom(_PM_MOD_SIZE))
+    # a: 32-byte random with MSB set
+    a = _to_int(os.urandom(32)) | (1 << 255)
     A = pow(g, a, N)
     A_b = _to_bytes(A)
 
     B = _to_int(server_ephemeral)
-    u = _to_int(_H(A_b, server_ephemeral))
-    x = _to_int(_H(salt, hashed_pw))
+    u = _to_int(_pmhash(A_b + server_ephemeral))
+    x = _to_int(hashed_pw)
 
     S = pow((B - k * pow(g, x, N)) % N, a + u * x, N)
-    K = _H(_to_bytes(S))
 
-    HN_xor_Hg = bytes(a ^ b for a, b in zip(_H(modulus), _H(_to_bytes(g, 1))))
-    M1 = _H(HN_xor_Hg, _H(username.encode()), salt, A_b, server_ephemeral, K)
+    # K = S as raw bytes (no hashing)
+    K = _to_bytes(S)
+
+    # M1 = PMHash(A | B | K)
+    M1 = _pmhash(A_b + server_ephemeral + K)
 
     return A_b, M1
 
@@ -299,8 +301,8 @@ def proton_authenticate(username: str, password: str,
     version          = info.get("Version", 4)
 
     # Step 2: Derive SRP proof
-    hashed_pw = _hash_password(password, salt, version)
-    A_b, M1   = _srp_proofs(modulus, server_ephemeral, salt, hashed_pw, username)
+    hashed_pw = _hash_password(password, salt, modulus, version)
+    A_b, M1   = _srp_proofs(modulus, server_ephemeral, salt, hashed_pw)
 
     # Step 3: Complete authentication
     try:
