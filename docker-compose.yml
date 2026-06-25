@@ -170,6 +170,7 @@ services:
     networks:
       ts-net:
         ipv4_address: ${IP_PROTONVPN}
+        ipv6_address: ${IP_VPN_V6}
 
   control-panel:
     build:
