@@ -14,8 +14,8 @@ import subprocess
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-GATEWAY_STATE = "/tmp/active_gateway"
-GATEWAY_STATE_V6 = "/tmp/active_gateway_v6"
+GATEWAY_STATE = "/var/lib/tailscale/active_gateway"
+GATEWAY_STATE_V6 = "/var/lib/tailscale/active_gateway_v6"
 
 
 def _active_ip():

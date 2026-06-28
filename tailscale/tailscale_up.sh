@@ -32,11 +32,20 @@ while [ $i -lt 60 ]; do
 done
 ps auxwwf
 
-ACTIVE_GW_FILE="/tmp/active_gateway"
-ACTIVE_GW_FILE_V6="/tmp/active_gateway_v6"
-echo "$IP_NORDVPN" > "$ACTIVE_GW_FILE"
-ip route del default
-ip route add default via $IP_NORDVPN dev eth0
+ACTIVE_GW_FILE="/var/lib/tailscale/active_gateway"
+ACTIVE_GW_FILE_V6="/var/lib/tailscale/active_gateway_v6"
+
+# Restore saved gateway (falls back to NordVPN if no state saved yet).
+SAVED_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
+echo "$SAVED_GW" > "$ACTIVE_GW_FILE"
+ip route del default 2>/dev/null || true
+ip route add default via "$SAVED_GW" dev eth0
+
+# Restore saved IPv6 gateway if one was previously configured.
+SAVED_GW_V6=$(cat "$ACTIVE_GW_FILE_V6" 2>/dev/null || echo "")
+if [ -n "$SAVED_GW_V6" ]; then
+  ip -6 route replace default via "$SAVED_GW_V6" dev eth0 2>/dev/null || true
+fi
 
 nohup python3 /gateway_api.py >/tmp/gateway_api.log 2>&1 &
 
