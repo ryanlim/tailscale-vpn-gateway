@@ -160,6 +160,7 @@ services:
     environment:
       - INSTANCE_NAME=${INSTANCE_NAME}
       - WG_CONF=${PROTONVPN_WG_CONF:-/etc/wireguard/US/San_Jose/us-ca_10.conf}
+      - PROTONVPN_CITY=${PROTONVPN_CITY:-}
     volumes:
       - "/dev/net/tun:/dev/net/tun"
       - "/lib/modules:/lib/modules:ro"

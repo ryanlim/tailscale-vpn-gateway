@@ -76,6 +76,7 @@ expected; see *TLS* below).
 | `IP_SUBNET_V6`                 | Docker network IPv6 CIDR (e.g. `fd00:cafe:1::/64`). Required for ProtonVPN (IPv6 exit support). |
 | `IP_VPN_V6`                    | ProtonVPN container's static IPv6 address within `IP_SUBNET_V6` (e.g. `fd00:cafe:1::10`). |
 | `PROTONVPN_WG_CONF`            | Path inside the container to the WireGuard config to use on startup. Defaults to `US/San_Jose/us-ca_10.conf` if unset. |
+| `PROTONVPN_CITY`               | Default city to connect to on startup, e.g. `US/San_Jose`. Uses `Country/City_Name` format (underscores for spaces), matching the wireguard directory layout. Persisted across restarts — once set, the container reconnects to the last-used city regardless of `WG_CONF`. |
 
 ### `control-panel/config/backends.json`
 

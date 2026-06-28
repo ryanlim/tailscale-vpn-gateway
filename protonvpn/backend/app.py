@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 WG_DIR = Path(os.environ.get("WG_DIR", "/etc/wireguard"))
 WG_CONF = os.environ.get("WG_CONF", str(WG_DIR / "free-us-8.conf"))
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "protonvpn")
+# Default city/server to connect to on startup (e.g. "_city:US:San Jose").
+# Persisted to .target_city in the wireguard volume so restarts reconnect to
+# the last-used location rather than the entrypoint's WG_CONF fallback.
+PROTONVPN_CITY = os.environ.get("PROTONVPN_CITY", "")
+CITY_TARGET_FILE = WG_DIR / ".target_city"
 ACTIVE_IFACE_FILE = Path("/tmp/active_wg_iface")
 INDEX_PATH = WG_DIR / "index.json"
 
@@ -818,18 +823,26 @@ def status():
     })
 
 
-@app.route("/api/v1/connect", methods=["POST"])
-def connect():
-    data = request.get_json(silent=True) or {}
-    target = (data.get("server") or "").strip()
-    if not target:
-        return jsonify({"error": "server is required"}), 400
+def _connect_to_target(target: str) -> tuple[str | None, str, str | None]:
+    """Connect to a server stem or city code.
+
+    Returns (message, wg_output, error). Exactly one of message/error is set.
+    Persists the chosen target to CITY_TARGET_FILE so container restarts
+    reconnect to the same location.
+    """
+    original_target = target
+
+    # Accept NordVPN-style Country/City_Name format (e.g. "US/San_Jose").
+    # Underscores in the city part are treated as spaces to match index.json.
+    if "/" in target and not target.startswith("_city:"):
+        cc, _, city_slug = target.partition("/")
+        target = f"_city:{cc.upper()}:{city_slug.replace('_', ' ')}"
 
     # City-level selection: auto-pick the lowest-load server for COUNTRY/CITY.
     if target.startswith("_city:"):
         parts = target.split(":", 2)
         if len(parts) != 3:
-            return jsonify({"error": f"Invalid city code: {target}"}), 400
+            return None, "", f"Invalid city code: {target}"
         _, country, city = parts
         index = _load_index()
         candidates = [
@@ -838,7 +851,7 @@ def connect():
             and (s.get("city") or "") == city
         ]
         if not candidates:
-            return jsonify({"error": f"No servers found for {country}/{city}"}), 404
+            return None, "", f"No servers found for {country}/{city}"
         # Prefer IPv6-capable servers: the WireGuard tunnel address (2a07:b944::2:2/128)
         # only works if the server has the ipv6 feature; non-IPv6 servers drop IPv6 packets.
         ipv6_candidates = [s for s in candidates if "ipv6" in s.get("features", [])]
@@ -849,7 +862,7 @@ def connect():
 
     conf = _find_conf(target)
     if conf is None:
-        return jsonify({"error": f"Config not found: {target}.conf"}), 400
+        return None, "", f"Config not found: {target}.conf"
 
     # The WireGuard interface name is always the config basename (stem), regardless
     # of whether target was supplied as a path ("US/Dallas/us-tx_477") or bare name.
@@ -858,7 +871,7 @@ def connect():
     with _lock:
         current = _active_iface()
         if current and current == iface and _wg_show(iface):
-            return jsonify({"message": f"Already connected to {iface}", "output": ""})
+            return f"Already connected to {iface}", "", None
 
         # Clear stale IP cache so the status endpoint shows no IPs rather than
         # the previous server's location while the new tunnel is establishing.
@@ -892,7 +905,7 @@ def connect():
                 finally:
                     _exempt_management_del()
             err = getattr(exc, 'stderr', None) or 'wg-quick timed out'
-            return jsonify({"error": f"wg-quick up failed: {err}"}), 500
+            return None, "", f"wg-quick up failed: {err}"
 
         _exempt_management_del()
 
@@ -902,6 +915,13 @@ def connect():
         _connect_time = time.time()
         _masquerade_update(None, iface, _conf_has_ipv6(conf))
         ACTIVE_IFACE_FILE.write_text(iface)
+
+        # Persist so the next container restart reconnects here instead of
+        # falling back to the entrypoint's WG_CONF default.
+        try:
+            CITY_TARGET_FILE.write_text(original_target)
+        except OSError as exc:
+            logger.warning("Could not write %s: %s", CITY_TARGET_FILE, exc)
 
         # Wait for the WireGuard handshake and start the local agent in the
         # background so the HTTP response returns as soon as wg-quick up exits.
@@ -917,7 +937,46 @@ def connect():
             _ip_refresh_event.set()
         threading.Thread(target=_post_up, daemon=True, name=f"post-up-{iface}").start()
 
-        return jsonify({"message": f"Connected to {target}", "output": result.stdout})
+        return f"Connected to {original_target}", result.stdout, None
+
+
+def _startup_connect() -> None:
+    """Connect to the saved target (or PROTONVPN_CITY default) after startup.
+
+    Runs in a background thread so it doesn't block the Flask server from
+    starting. Waits briefly for the entrypoint's wg-quick tunnel to settle
+    before switching to the preferred city/server.
+    """
+    time.sleep(8)
+    target = ""
+    try:
+        target = CITY_TARGET_FILE.read_text().strip()
+    except OSError:
+        pass
+    if not target:
+        target = PROTONVPN_CITY
+    if not target:
+        logger.info("startup-connect: no PROTONVPN_CITY set, keeping entrypoint default")
+        return
+    logger.info("startup-connect: connecting to %s", target)
+    message, _, error = _connect_to_target(target)
+    if error:
+        logger.warning("startup-connect: %s", error)
+    else:
+        logger.info("startup-connect: %s", message)
+
+
+@app.route("/api/v1/connect", methods=["POST"])
+def connect():
+    data = request.get_json(silent=True) or {}
+    target = (data.get("server") or "").strip()
+    if not target:
+        return jsonify({"error": "server is required"}), 400
+    message, output, error = _connect_to_target(target)
+    if error:
+        status = 404 if "No servers found" in error else (400 if "Config not found" in error or "Invalid city" in error else 500)
+        return jsonify({"error": error}), status
+    return jsonify({"message": message, "output": output})
 
 
 @app.route("/api/v1/disconnect", methods=["POST"])
@@ -1383,4 +1442,7 @@ if __name__ == "__main__":
     # is only started on connect() or cert refresh, so a container restart with a
     # still-valid cert would leave the tunnel unauthenticated until reconnect.
     _local_agent.start()
+    # Connect to the saved target or PROTONVPN_CITY default in the background,
+    # giving the entrypoint's wg-quick tunnel a moment to settle first.
+    threading.Thread(target=_startup_connect, daemon=True, name="startup-connect").start()
     app.run(host="0.0.0.0", port=80, threaded=True)
