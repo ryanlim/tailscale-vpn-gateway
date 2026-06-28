@@ -300,57 +300,20 @@ class _CertRefresher:
             logger.warning("cert-refresher: could not derive public key: %s", exc)
         return None
 
-    def _get_wg_pubkey(self) -> str | None:
-        """Derive WireGuard Curve25519 public key (base64) from the active config.
-
-        Proton's /vpn/v1/certificate accepts a DevicePublicKey field that links
-        the issued Ed25519 cert to a specific WireGuard device.  The local-agent
-        server at 10.2.0.1 uses this link to verify the client's cert fingerprint.
-        Without it the cert is issued but the gateway's mapping is not updated,
-        so the local agent keeps expecting the old fingerprint (code 86202).
-        """
-        iface = _active_iface()
-        conf = _find_conf(iface) if iface else None
-        if conf is None:
-            conf = Path(WG_CONF)
-        try:
-            for line in conf.read_text().splitlines():
-                if line.strip().lower().startswith("privatekey"):
-                    privkey = line.split("=", 1)[1].strip()
-                    result = subprocess.run(
-                        ["wg", "pubkey"],
-                        input=privkey + "\n",
-                        capture_output=True, text=True, timeout=5,
-                    )
-                    if result.returncode == 0:
-                        return result.stdout.strip()
-        except Exception as exc:
-            logger.warning("cert-refresher: could not derive WireGuard public key: %s", exc)
-        return None
-
     def _fetch_cert(self, creds: dict, pubkey_pem: str) -> tuple[str | None, dict, bool]:
         """POST /vpn/v1/certificate. Returns (cert_pem, updated_creds, False) or (None, creds, False).
 
         Handles one automatic retry:
           attempt 0 → 401: refresh the access token and retry
 
-        DevicePublicKey (WireGuard Curve25519 base64) is included so Proton's backend
-        links the issued cert to the WireGuard device — without it the renewal may
-        return 409/2500 and the local-agent server at 10.2.0.1 won't update its
-        expected fingerprint (code 86202).
-
-        409/2500 'fingerprint conflict' without the key regen: this error means the
-        device binding in Proton's backend is broken and requires re-downloading a
-        fresh WireGuard config from account.proton.me to restore the link between
-        the Curve25519 WireGuard key and a new Ed25519 cert.  We do NOT regenerate
-        the local key here — that would create an unlinked key that the gateway
-        permanently rejects.
+        No DevicePublicKey is sent.  The local-agent gateway validates authentication
+        mathematically: it derives the X25519 key from the presented Ed25519 cert key
+        and checks that SHA512(X25519) == SHA512(WireGuard session Curve25519 key).
+        This works as long as the WireGuard private key is the X25519 key derived from
+        the Ed25519 private key via crypto_sign_ed25519_sk_to_curve25519 (the key in
+        client.key).  Sending a random DevicePublicKey causes 409/2500 conflicts.
         """
-        wg_pubkey = self._get_wg_pubkey()
         body: dict = {"ClientPublicKey": pubkey_pem, "Duration": "10080 min"}
-        if wg_pubkey:
-            body["DevicePublicKey"] = wg_pubkey
-            logger.info("cert-refresher: including DevicePublicKey=%s...", wg_pubkey[:12])
         for attempt in range(2):
             try:
                 r = requests.post(
@@ -394,13 +357,7 @@ class _CertRefresher:
         return None, creds, False
 
     def _reconnect_tunnel(self) -> None:
-        """Reconnect the active WireGuard tunnel to pick up an updated cert binding.
-
-        After a cert renewal that includes DevicePublicKey, the Proton gateway needs
-        a fresh WireGuard session to serve the updated cert fingerprint to the local
-        agent.  Called by proton_refresh_cert when the user explicitly requests a
-        cert+reconnect cycle.
-        """
+        """Reconnect the active WireGuard tunnel (e.g. after changing the WireGuard key)."""
         try:
             iface = _active_iface()
             if not iface:
