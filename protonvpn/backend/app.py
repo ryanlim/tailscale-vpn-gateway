@@ -372,6 +372,9 @@ class _CertRefresher:
                 ["wg-quick", "up", str(conf)],
                 capture_output=True, timeout=30,
             )
+            # wg-quick skips iptables MASQUERADE in containers (read-only sysctl);
+            # re-add it explicitly so forwarded traffic is NATted correctly.
+            _masquerade_update(None, iface, _conf_has_ipv6(conf))
             logger.info("cert-refresher: tunnel %s reconnected", iface)
         except Exception as exc:
             logger.warning("cert-refresher: tunnel reconnect failed: %s", exc)
@@ -836,7 +839,11 @@ def connect():
         ]
         if not candidates:
             return jsonify({"error": f"No servers found for {country}/{city}"}), 404
-        best = random.choice(candidates)
+        # Prefer IPv6-capable servers: the WireGuard tunnel address (2a07:b944::2:2/128)
+        # only works if the server has the ipv6 feature; non-IPv6 servers drop IPv6 packets.
+        ipv6_candidates = [s for s in candidates if "ipv6" in s.get("features", [])]
+        pool = ipv6_candidates if ipv6_candidates else candidates
+        best = random.choice(pool)
         target = Path(best["path"]).stem
         logger.info("City random-select %s/%s → %s", country, city, target)
 
