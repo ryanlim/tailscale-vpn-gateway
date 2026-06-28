@@ -300,9 +300,57 @@ class _CertRefresher:
             logger.warning("cert-refresher: could not derive public key: %s", exc)
         return None
 
-    def _fetch_cert(self, creds: dict, pubkey_pem: str) -> tuple[str | None, dict]:
-        """POST /vpn/v1/certificate. Returns (cert_pem, updated_creds) or (None, creds)."""
-        body = {"ClientPublicKey": pubkey_pem, "Duration": "10080 min"}
+    def _get_wg_pubkey(self) -> str | None:
+        """Derive WireGuard Curve25519 public key (base64) from the active config.
+
+        Proton's /vpn/v1/certificate accepts a DevicePublicKey field that links
+        the issued Ed25519 cert to a specific WireGuard device.  The local-agent
+        server at 10.2.0.1 uses this link to verify the client's cert fingerprint.
+        Without it the cert is issued but the gateway's mapping is not updated,
+        so the local agent keeps expecting the old fingerprint (code 86202).
+        """
+        iface = _active_iface()
+        conf = _find_conf(iface) if iface else None
+        if conf is None:
+            conf = Path(WG_CONF)
+        try:
+            for line in conf.read_text().splitlines():
+                if line.strip().lower().startswith("privatekey"):
+                    privkey = line.split("=", 1)[1].strip()
+                    result = subprocess.run(
+                        ["wg", "pubkey"],
+                        input=privkey + "\n",
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode == 0:
+                        return result.stdout.strip()
+        except Exception as exc:
+            logger.warning("cert-refresher: could not derive WireGuard public key: %s", exc)
+        return None
+
+    def _fetch_cert(self, creds: dict, pubkey_pem: str) -> tuple[str | None, dict, bool]:
+        """POST /vpn/v1/certificate. Returns (cert_pem, updated_creds, False) or (None, creds, False).
+
+        Handles one automatic retry:
+          attempt 0 → 401: refresh the access token and retry
+
+        DevicePublicKey (WireGuard Curve25519 base64) is included so Proton's backend
+        links the issued cert to the WireGuard device — without it the renewal may
+        return 409/2500 and the local-agent server at 10.2.0.1 won't update its
+        expected fingerprint (code 86202).
+
+        409/2500 'fingerprint conflict' without the key regen: this error means the
+        device binding in Proton's backend is broken and requires re-downloading a
+        fresh WireGuard config from account.proton.me to restore the link between
+        the Curve25519 WireGuard key and a new Ed25519 cert.  We do NOT regenerate
+        the local key here — that would create an unlinked key that the gateway
+        permanently rejects.
+        """
+        wg_pubkey = self._get_wg_pubkey()
+        body: dict = {"ClientPublicKey": pubkey_pem, "Duration": "10080 min"}
+        if wg_pubkey:
+            body["DevicePublicKey"] = wg_pubkey
+            logger.info("cert-refresher: including DevicePublicKey=%s...", wg_pubkey[:12])
         for attempt in range(2):
             try:
                 r = requests.post(
@@ -315,21 +363,61 @@ class _CertRefresher:
                     logger.info("cert-refresher: access token expired, refreshing...")
                     new_creds = self._refresh_token(creds)
                     if new_creds is None:
-                        return None, creds
+                        return None, creds, False
                     creds = new_creds
                     continue
+                if r.status_code == 409:
+                    try:
+                        err_code = r.json().get("Code", 0)
+                    except Exception:
+                        err_code = 0
+                    if err_code == 2500:
+                        logger.error(
+                            "cert-refresher: 409/2500 fingerprint conflict — "
+                            "re-download the WireGuard config from account.proton.me "
+                            "to restore the device→cert binding"
+                        )
+                    else:
+                        logger.warning("cert-refresher: cert fetch HTTP 409: %s", r.text[:200])
+                    return None, creds, False
                 if r.ok:
                     cert_pem = r.json().get("Certificate")
                     if cert_pem:
-                        return cert_pem, creds
+                        return cert_pem, creds, False
                     logger.warning("cert-refresher: API response missing 'Certificate' field")
-                    return None, creds
+                    return None, creds, False
                 logger.warning("cert-refresher: cert fetch HTTP %s: %s", r.status_code, r.text[:200])
-                return None, creds
+                return None, creds, False
             except Exception as exc:
                 logger.warning("cert-refresher: cert fetch error: %s", exc)
-                return None, creds
-        return None, creds
+                return None, creds, False
+        return None, creds, False
+
+    def _reconnect_tunnel(self) -> None:
+        """Reconnect the active WireGuard tunnel to pick up an updated cert binding.
+
+        After a cert renewal that includes DevicePublicKey, the Proton gateway needs
+        a fresh WireGuard session to serve the updated cert fingerprint to the local
+        agent.  Called by proton_refresh_cert when the user explicitly requests a
+        cert+reconnect cycle.
+        """
+        try:
+            iface = _active_iface()
+            if not iface:
+                return
+            conf = _find_conf(iface)
+            if conf is None or not conf.exists():
+                return
+            logger.info("cert-refresher: reconnecting tunnel %s", iface)
+            _wg_down(iface)
+            time.sleep(1)
+            subprocess.run(
+                ["wg-quick", "up", str(conf)],
+                capture_output=True, timeout=30,
+            )
+            logger.info("cert-refresher: tunnel %s reconnected", iface)
+        except Exception as exc:
+            logger.warning("cert-refresher: tunnel reconnect failed: %s", exc)
 
     def _do_refresh(self) -> bool:
         """Run one certificate refresh cycle. Returns True on success."""
@@ -340,12 +428,13 @@ class _CertRefresher:
         pubkey_pem = self._get_pubkey_pem()
         if pubkey_pem is None:
             return False
-        cert_pem, _creds = self._fetch_cert(creds, pubkey_pem)
+        cert_pem, _creds, _ = self._fetch_cert(creds, pubkey_pem)
         if cert_pem is None:
             return False
         LOCAL_AGENT_CERT.write_text(cert_pem)
         LOCAL_AGENT_CERT.chmod(0o600)
         logger.info("cert-refresher: new certificate written to %s", LOCAL_AGENT_CERT)
+        _local_agent.stop()
         _local_agent.start()
         logger.info("cert-refresher: local agent restarted with new certificate")
         return True
@@ -973,6 +1062,36 @@ def reload_cert():
     return jsonify({"message": "local agent restarted with updated certificate"})
 
 
+@app.route("/api/v1/proton/refresh-cert", methods=["POST"])
+def proton_refresh_cert():
+    """Re-register the client certificate with ProtonVPN and restart the local agent.
+
+    Fetches a new cert from /vpn/v1/certificate (including DevicePublicKey to update
+    the gateway's cert-fingerprint mapping), then reconnects the WireGuard tunnel so
+    the gateway creates a fresh session with the updated mapping, and finally restarts
+    the local agent.  Use this to fix local-agent 86202 rejections after a key
+    regeneration or any time the cert and the gateway mapping are out of sync.
+
+    Body (optional): {"reconnect": true|false}  — default true.
+    Requires credentials.json to be present (log in via /proton/login first).
+    """
+    if _cert_refresher._load_creds() is None:
+        return jsonify({"error": "credentials.json missing — log in first"}), 400
+    data = request.get_json(silent=True) or {}
+    do_reconnect = data.get("reconnect", True)
+
+    def _run() -> None:
+        ok = _cert_refresher._do_refresh()
+        if ok and do_reconnect:
+            _cert_refresher._reconnect_tunnel()
+            _local_agent.stop()
+            _local_agent.start()
+            logger.info("refresh-cert: tunnel reconnected and local agent restarted")
+
+    threading.Thread(target=_run, daemon=True, name="force-refresh-cert").start()
+    return jsonify({"message": "Certificate refresh + reconnect triggered — check logs"})
+
+
 _REFRESH_SCRIPT = Path("/scripts/download_wg_configs.py")
 _refresh_lock   = threading.Lock()
 _refresh_status: dict = {"state": "idle", "message": "", "started": 0.0}
@@ -1295,4 +1414,9 @@ def _save_login_creds(auth: dict) -> None:
 if __name__ == "__main__":
     _cert_refresher.start()
     _ip_poller.start()
+    # Start the local agent at launch if the tunnel is already up (entrypoint.sh
+    # brings up wg-quick before starting this process).  Without this, the agent
+    # is only started on connect() or cert refresh, so a container restart with a
+    # still-valid cert would leave the tunnel unauthenticated until reconnect.
+    _local_agent.start()
     app.run(host="0.0.0.0", port=80, threaded=True)
