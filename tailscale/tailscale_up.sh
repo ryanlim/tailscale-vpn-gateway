@@ -51,9 +51,9 @@ nohup python3 /gateway_api.py >/tmp/gateway_api.log 2>&1 &
 
 INSTANCE_NAME_=$(echo $INSTANCE_NAME | sed 's/_/-/g')
 
-# Number of consecutive watchdog cycles where VPN is up but tailscale looks
-# broken before we kick tailscale. 60s per cycle, so 2 = ~2 minutes.
-UNHEALTHY_THRESHOLD=2
+# Number of consecutive watchdog cycles where VPN is up but egress is broken
+# before we kick tailscale. 20s per cycle, so 2 = ~40 seconds.
+UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-2}
 
 # Egress probe: URLs the watchdog fetches to prove real internet connectivity
 # through the VPN tunnel (default route -> nordvpn-wg -> WireGuard). The probe
@@ -91,12 +91,6 @@ is_vpn_connected() {
     | grep -q '"status": *"Connected"'
 }
 
-is_tailscale_healthy() {
-  # Daemon liveness only. Bounded with timeout so a hung daemon can't stall
-  # the watchdog loop. Note this proves the daemon answers, NOT that traffic
-  # flows — has_egress covers actual connectivity.
-  timeout 10 tailscale status --peers=false >/dev/null 2>&1
-}
 
 has_egress() {
   # Real connectivity check: can we actually reach the internet through the
@@ -183,8 +177,8 @@ nginx -t && nginx
 nohup /usr/bin/node_exporter >/tmp/node_exporter.log 2>&1 &
 
 UNHEALTHY_COUNT=0
-while [ 1 ]; do
-  sleep 60
+while true; do
+  sleep 20
   date
 
   pidof tailscaled >/dev/null || tailscaled &
@@ -202,29 +196,35 @@ while [ 1 ]; do
       || ip -6 route replace default via "$ACTIVE_GW_V6" dev eth0 2>/dev/null || true
   fi
 
-  # Safeguard: only evaluate tailscale's health when the VPN backend itself
-  # reports Connected. If the VPN is down, unreachable, or mid-reconnect,
-  # egress will fail for reasons kicking tailscale can't fix — hold off so we
-  # don't restart-loop during upstream outages or captive portals.
+  # Check BackendState regardless of VPN status. This catches NeedsLogin,
+  # Stopped, and Starting — the exact states the user would otherwise have
+  # to fix manually with `tailscale up` — without waiting for egress to fail.
+  TS_STATE=$(timeout 10 tailscale status --json 2>/dev/null \
+    | grep -o '"BackendState":"[^"]*"' | cut -d'"' -f4)
+  if [ "$TS_STATE" != "Running" ]; then
+    echo "tailscale BackendState=${TS_STATE:-unreachable}; running tailscale up"
+    do_tailscale_up
+    UNHEALTHY_COUNT=0
+    sleep 30
+    continue
+  fi
+
+  # Tailscale is Running. Only check egress when the VPN backend is also
+  # Connected — if the VPN is down or mid-reconnect, egress failure is not
+  # something kicking tailscale can fix.
   if ! is_vpn_connected; then
-    echo "VPN not reporting Connected; deferring tailscale health check"
+    echo "VPN not reporting Connected; deferring egress check"
     UNHEALTHY_COUNT=0
     continue
   fi
 
-  # VPN says Connected. Tailscale is healthy only if the daemon answers AND
-  # traffic actually reaches the internet through the tunnel. The egress probe
-  # is what catches the wedged-but-status-OK case the bare status check missed.
-  TS_OK=no; is_tailscale_healthy && TS_OK=yes
-  EGRESS_OK=no; has_egress && EGRESS_OK=yes
-
-  if [ "$TS_OK" = yes ] && [ "$EGRESS_OK" = yes ]; then
+  if has_egress; then
     UNHEALTHY_COUNT=0
     continue
   fi
 
   UNHEALTHY_COUNT=$((UNHEALTHY_COUNT + 1))
-  echo "tailscale unhealthy (daemon=$TS_OK egress=$EGRESS_OK) while VPN reports Connected (count=$UNHEALTHY_COUNT)"
+  echo "no egress while VPN+tailscale both report healthy (count=$UNHEALTHY_COUNT/$UNHEALTHY_THRESHOLD)"
   if [ "$UNHEALTHY_COUNT" -ge "$UNHEALTHY_THRESHOLD" ]; then
     echo "kicking tailscale"
     tailscale down 2>/dev/null
