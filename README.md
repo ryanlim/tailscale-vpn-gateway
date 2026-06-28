@@ -72,11 +72,10 @@ expected; see *TLS* below).
 | `NORDVPN_ENDPOINT`             | Initial target city (e.g. `San_Francisco`). The control panel can change this at runtime. |
 | `NORDVPN_RECONNECT_AFTER_HOURS`| Backend rotates to a fresh server on this cadence. |
 | `NORDVPN_TECHNOLOGY` / `NORDVPN_OPENVPN_PROTOCOL` | Only used by the legacy `nordvpn` backend. |
-
-ProtonVPN credentials are not stored in `.env`. Instead, use the **Log in**
-button in the control panel to authenticate with your ProtonVPN account over
-SRP. Credentials are persisted inside the container's bind-mounted volume and
-refreshed automatically.
+| `IP_PROTONVPN`                 | Static IP for the protonvpn container on the docker network. Required when running that service. |
+| `IP_SUBNET_V6`                 | Docker network IPv6 CIDR (e.g. `fd00:cafe:1::/64`). Required for ProtonVPN (IPv6 exit support). |
+| `IP_VPN_V6`                    | ProtonVPN container's static IPv6 address within `IP_SUBNET_V6` (e.g. `fd00:cafe:1::10`). |
+| `PROTONVPN_WG_CONF`            | Path inside the container to the WireGuard config to use on startup. Defaults to `US/San_Jose/us-ca_10.conf` if unset. |
 
 ### `control-panel/config/backends.json`
 
@@ -102,6 +101,77 @@ v1 API contract.
 The file is re-read on each request, so edits take effect without a
 restart. The panel UI remembers the last-selected backend in
 `localStorage` and falls back to the first entry on a fresh browser.
+
+## ProtonVPN first-time setup
+
+The `protonvpn/wireguard/` directory is **gitignored** — it contains your
+WireGuard private key and must be populated before the container will start.
+The `download_wg_configs.py` script handles this: it authenticates with the
+ProtonVPN API, fetches the full server list, and writes a `.conf` file per
+server organised as `<COUNTRY>/<City>/<server>.conf`.
+
+### Step 1 — get a WireGuard private key
+
+Download any single WireGuard config from the ProtonVPN portal
+(`account.proton.me → Downloads → WireGuard configuration`). ProtonVPN
+generates and registers the key pair automatically. Copy the `PrivateKey`
+line from the downloaded file — the same key works for every server.
+
+### Step 2 — run the downloader
+
+```sh
+cd /path/to/ts-vpn-01
+
+# Authenticate with username/password (SRP — no plain-text password stored):
+python3 protonvpn/scripts/download_wg_configs.py \
+  -u your@proton.me -p yourpassword \
+  --private-key 'YOUR_PRIVATE_KEY_HERE=' \
+  --output-dir protonvpn/wireguard
+
+# Or skip SRP auth with a pre-existing session UID + access token:
+python3 protonvpn/scripts/download_wg_configs.py \
+  --uid <uid> --access-token <token> \
+  --private-key 'YOUR_PRIVATE_KEY_HERE=' \
+  --output-dir protonvpn/wireguard
+```
+
+Useful filters (see `--help` for full list):
+
+```sh
+# Only Plus-tier servers
+--tier plus
+
+# Only servers under 50% load
+--max-load 50
+
+# Single country
+--country JP
+
+# Preview what would be written without touching disk
+--dry-run
+```
+
+### Step 3 — configure `.env` and start
+
+Add the ProtonVPN network variables to `.env` (see the `.env` table above),
+then start the service:
+
+```sh
+docker compose up -d --build protonvpn
+```
+
+The default `WG_CONF` is `US/San_Jose/us-ca_10.conf`. Override it with
+`PROTONVPN_WG_CONF` in `.env` to pick a different server on startup.
+
+### Transferring configs to another host
+
+Because the wireguard directory is gitignored, a fresh clone on a new host
+starts empty. Either run the downloader again, or rsync from a working host:
+
+```sh
+rsync -av /path/to/ts-vpn-01/protonvpn/wireguard/ \
+  <other-host>:/path/to/ts-vpn-01/protonvpn/wireguard/
+```
 
 ## TLS certs
 
