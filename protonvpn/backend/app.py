@@ -179,7 +179,7 @@ class _LocalAgent:
                                 pass
             except OSError as exc:
                 if not self._stop.is_set():
-                    logger.debug("Local agent connection failed: %s", exc)
+                    logger.warning("Local agent connection lost: %s", exc)
                     self._stop.wait(10)
             finally:
                 self._raw = None

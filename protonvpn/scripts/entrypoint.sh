@@ -11,9 +11,9 @@ if [ -z "$WG_CONF" ] || [ ! -f "$WG_CONF" ]; then
 fi
 WG_IFACE=$(basename "$WG_CONF" .conf)
 ACTIVE_IFACE_FILE=/tmp/active_wg_iface
-EGRESS_CHECK_INTERVAL=${EGRESS_CHECK_INTERVAL:-60}
+EGRESS_CHECK_INTERVAL=${EGRESS_CHECK_INTERVAL:-20}
 EGRESS_CHECK_TIMEOUT=${EGRESS_CHECK_TIMEOUT:-8}
-UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
+UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-2}
 
 # Load legacy ip6tables modules so ip6tables NAT works in-container.
 # The host kernel may use nftables and not load these automatically.

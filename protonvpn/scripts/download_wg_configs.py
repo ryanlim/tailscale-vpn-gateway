@@ -481,6 +481,7 @@ def make_wg_conf(label: str, private_key: str, server_pubkey: str,
         f"PrivateKey = {private_key}\n"
         f"Address = {addrs}\n"
         f"DNS = {dns}\n"
+        f"MTU = 1420\n"
         f"\n"
         f"[Peer]\n"
         f"# {label}\n"
