@@ -913,6 +913,11 @@ def _connect_to_target(target: str, exclude: set[str] | None = None) -> tuple[st
     with _lock:
         current = _active_iface()
         if current and current == iface and _wg_show(iface):
+            # Persist city so reconnect() knows the target on next watchdog cycle.
+            try:
+                CITY_TARGET_FILE.write_text(original_target)
+            except OSError:
+                pass
             return f"Already connected to {iface}", "", None
 
         # Clear stale IP cache so the status endpoint shows no IPs rather than
@@ -982,6 +987,19 @@ def _connect_to_target(target: str, exclude: set[str] | None = None) -> tuple[st
         return f"Connected to {original_target}", result.stdout, None
 
 
+def _city_from_conf_path(conf_path: Path) -> str:
+    """Derive a _city:CC:City code from a conf path like .../CC/City_Name/server.conf."""
+    try:
+        rel = conf_path.relative_to(WG_DIR)
+        if len(rel.parts) >= 3:
+            cc = rel.parts[-3].upper()
+            city_name = rel.parts[-2].replace("_", " ")
+            return f"_city:{cc}:{city_name}"
+    except ValueError:
+        pass
+    return ""
+
+
 def _startup_connect() -> None:
     """Connect to the saved target (or PROTONVPN_CITY default) after startup.
 
@@ -998,10 +1016,19 @@ def _startup_connect() -> None:
     if not target:
         target = PROTONVPN_CITY
     if not target:
-        logger.info("startup-connect: no PROTONVPN_CITY set, keeping entrypoint default")
+        # Derive city from WG_CONF path so a fresh container (no saved target,
+        # no PROTONVPN_CITY env) still rotates away from the hardcoded default.
+        target = _city_from_conf_path(Path(WG_CONF))
+        if target:
+            logger.info("startup-connect: derived city from WG_CONF path → %s", target)
+    if not target:
+        logger.info("startup-connect: no city target known, keeping entrypoint default")
         return
-    logger.info("startup-connect: connecting to %s", target)
-    message, _, error = _connect_to_target(target)
+    # Rotate away from the entrypoint's default iface so a dead startup server
+    # doesn't become permanent.
+    default_iface = Path(WG_CONF).stem
+    logger.info("startup-connect: connecting to %s (exclude=%s)", target, default_iface)
+    message, _, error = _connect_to_target(target, exclude={default_iface})
     if error:
         logger.warning("startup-connect: %s", error)
     else:
@@ -1043,6 +1070,10 @@ def reconnect():
             pass
     if not target:
         target = _iface_to_city_code(current_iface) or ""
+    if not target:
+        conf = _find_conf(current_iface)
+        if conf:
+            target = _city_from_conf_path(conf)
     if not target:
         target = PROTONVPN_CITY
     if not target:
