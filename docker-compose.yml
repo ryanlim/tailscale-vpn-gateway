@@ -15,9 +15,12 @@ services:
     # DERP relays needs to work before any tunnel is up. Tailscale only
     # resolves external names (IP_NORDVPN/IP_PANEL are literals), so
     # losing docker's embedded resolver here is safe.
+    # Primary: ProtonVPN's in-tunnel DNS (only reachable when ProtonVPN is
+    # the active backend). Fallback: Cloudflare, used when NordVPN is active
+    # or before any VPN tunnel is up (container startup, reconnects).
     dns:
+      - 10.2.0.1
       - 1.1.1.1
-      - 8.8.8.8
     volumes:
       - "/dev/net/tun:/dev/net/tun"
       - "/lib/modules:/lib/modules:ro"

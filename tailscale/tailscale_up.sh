@@ -74,9 +74,9 @@ do_tailscale_up() {
   [ -n "$TAILSCALE_AUTH_KEY" ] && AUTH_KEY_ARG="--auth-key $TAILSCALE_AUTH_KEY"
 
   if [ -n "$TAILSCALE_UP_LOGIN_SERVER" ]; then
-    tailscale up --advertise-exit-node --hostname $INSTANCE_NAME_ --login-server $TAILSCALE_UP_LOGIN_SERVER $AUTH_KEY_ARG
+    tailscale up --advertise-exit-node --hostname $INSTANCE_NAME_ --login-server $TAILSCALE_UP_LOGIN_SERVER --accept-dns=false $AUTH_KEY_ARG
   else
-    tailscale up --advertise-exit-node --hostname $INSTANCE_NAME_ $AUTH_KEY_ARG
+    tailscale up --advertise-exit-node --hostname $INSTANCE_NAME_ --accept-dns=false $AUTH_KEY_ARG
   fi
 }
 
