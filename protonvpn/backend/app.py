@@ -834,7 +834,21 @@ def status():
         loc = ", ".join(filter(None, [ipv6.get("city"), ipv6.get("country_code")]))
         fields["Public IPv6"] = f"{ipv6['ip']} ({loc})" if loc else ipv6["ip"]
 
-    city_code = _iface_to_city_code(iface) or iface
+    city_code = _iface_to_city_code(iface)
+    if not city_code:
+        # Server absent from index.json (e.g. removed from ProtonVPN's list since last
+        # download but still on disk). Derive city from the conf path: CC/City/server.conf.
+        conf = _find_conf(iface)
+        if conf:
+            try:
+                rel = conf.relative_to(WG_DIR)
+                if len(rel.parts) >= 3:
+                    cc = rel.parts[-3].upper()
+                    city_name = rel.parts[-2].replace("_", " ")
+                    city_code = f"_city:{cc}:{city_name}"
+            except ValueError:
+                pass
+    city_code = city_code or iface
     return jsonify({
         "status": "Connected" if connected else "Disconnected",
         "server": iface,
