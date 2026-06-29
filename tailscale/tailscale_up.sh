@@ -85,10 +85,16 @@ is_vpn_connected() {
   # than $IP_NORDVPN means a runtime gateway switch is reflected immediately.
   # Empty/unreachable response counts as "not connected" so we err on the
   # side of NOT kicking tailscale when the backend is down or mid-reconnect.
-  local gw
+  local gw response
   gw=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
-  curl -fsS --max-time 5 "http://${gw}/api/v1/status" 2>/dev/null \
-    | grep -q '"status": *"Connected"'
+  response=$(curl -fsS --max-time 5 "http://${gw}/api/v1/status" 2>/dev/null) || return 1
+  echo "$response" | grep -q '"status": *"Connected"' || return 1
+  # Defer while ProtonVPN's local agent is mid-auth. The WireGuard handshake
+  # succeeds immediately but the server blocks forwarding until the TLS auth
+  # completes — kicking tailscale here can't help and would mask the real cause.
+  # "disconnected" = cert absent (free tier) so no auth needed; treat as ready.
+  echo "$response" | grep -q '"local_agent": *"connecting"' && return 1
+  return 0
 }
 
 

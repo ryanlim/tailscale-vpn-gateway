@@ -118,6 +118,23 @@ class _LocalAgent:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._raw: socket.socket | None = None  # closed by stop() to interrupt recv
+        self._auth_event = threading.Event()    # set when server confirms "connected"
+
+    @property
+    def state(self) -> str:
+        """Current state: 'connected', 'connecting', or 'disconnected'."""
+        if self._stop.is_set() or not (self._thread and self._thread.is_alive()):
+            return "disconnected"
+        return "connected" if self._auth_event.is_set() else "connecting"
+
+    def wait_for_auth(self, timeout: float = 75.0) -> bool:
+        """Block until the local agent is authenticated, or return True if no cert is needed.
+
+        Returns True on success (authenticated or cert absent), False on timeout.
+        """
+        if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
+            return True  # free tier or cert not yet provisioned — no auth required
+        return self._auth_event.wait(timeout=timeout)
 
     def start(self) -> None:
         if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
@@ -128,6 +145,7 @@ class _LocalAgent:
         self._thread.start()
 
     def stop(self) -> None:
+        self._auth_event.clear()
         self._stop.set()
         raw = self._raw
         if raw is not None:
@@ -164,12 +182,14 @@ class _LocalAgent:
                                 state = msg.get("status", {}).get("state", "")
                                 if state == "connected":
                                     logger.info("Local agent: connected")
+                                    self._auth_event.set()
                                 else:
                                     err = msg.get("error", {})
                                     code = err.get("code", 0)
                                     desc = err.get("description", "unknown")
                                     logger.warning("Local agent rejected (code %s): %s", code, desc)
                                     if code == 86202:
+                                        self._auth_event.clear()
                                         return
                             except (json.JSONDecodeError, KeyError):
                                 pass
@@ -182,9 +202,11 @@ class _LocalAgent:
                                     break
                             except TimeoutError:
                                 pass
+                        self._auth_event.clear()  # connection dropped; will reconnect
             except OSError as exc:
                 if not self._stop.is_set():
                     logger.warning("Local agent connection lost: %s", exc)
+                    self._auth_event.clear()
                     self._stop.wait(10)
             finally:
                 self._raw = None
@@ -820,10 +842,11 @@ def status():
         "city": f"ProtonVPN ({iface})",
         "fields": fields,
         "details": raw,
+        "local_agent": _local_agent.state,
     })
 
 
-def _connect_to_target(target: str) -> tuple[str | None, str, str | None]:
+def _connect_to_target(target: str, exclude: set[str] | None = None) -> tuple[str | None, str, str | None]:
     """Connect to a server stem or city code.
 
     Returns (message, wg_output, error). Exactly one of message/error is set.
@@ -856,6 +879,11 @@ def _connect_to_target(target: str) -> tuple[str | None, str, str | None]:
         # only works if the server has the ipv6 feature; non-IPv6 servers drop IPv6 packets.
         ipv6_candidates = [s for s in candidates if "ipv6" in s.get("features", [])]
         pool = ipv6_candidates if ipv6_candidates else candidates
+        if exclude:
+            filtered = [s for s in pool if Path(s["path"]).stem not in exclude]
+            if filtered:
+                pool = filtered
+            # else: only one server in this city — can't rotate, use it anyway
         best = random.choice(pool)
         target = Path(best["path"]).stem
         logger.info("City random-select %s/%s → %s", country, city, target)
@@ -977,6 +1005,51 @@ def connect():
         status = 404 if "No servers found" in error else (400 if "Config not found" in error or "Invalid city" in error else 500)
         return jsonify({"error": error}), status
     return jsonify({"message": message, "output": output})
+
+
+@app.route("/api/v1/reconnect", methods=["POST"])
+def reconnect():
+    """Reconnect to a different server in the same city, then wait for local agent auth.
+
+    Used by the entrypoint.sh watchdog instead of raw wg-quick restarts.  By
+    delegating here the watchdog gets server rotation (avoids a dead server) and
+    a synchronous signal that forwarding is actually unblocked — not just that
+    wg-quick exited.
+
+    Body (optional): {"target": "US/San_Jose"}  — defaults to the persisted city
+    """
+    data = request.get_json(silent=True) or {}
+    current_iface = _active_iface()
+
+    target = (data.get("target") or "").strip()
+    if not target:
+        try:
+            target = CITY_TARGET_FILE.read_text().strip()
+        except OSError:
+            pass
+    if not target:
+        target = _iface_to_city_code(current_iface) or ""
+    if not target:
+        target = PROTONVPN_CITY
+    if not target:
+        return jsonify({"error": "No city target known — set PROTONVPN_CITY or connect manually first"}), 400
+
+    logger.info("reconnect: rotating away from %s → %s", current_iface, target)
+    message, _output, error = _connect_to_target(target, exclude={current_iface})
+    if error:
+        return jsonify({"status": "failed", "error": error}), 500
+
+    # Block until the local agent authenticates (or cert absent → returns True immediately).
+    # This is the key difference from /connect: the caller knows forwarding is unblocked.
+    auth_ok = _local_agent.wait_for_auth(timeout=75.0)
+    new_iface = _active_iface()
+    logger.info("reconnect: %s local_agent=%s auth_ok=%s", new_iface, _local_agent.state, auth_ok)
+    return jsonify({
+        "status": "connected" if auth_ok else "connected_pending_auth",
+        "server": new_iface,
+        "message": message,
+        "local_agent": _local_agent.state,
+    })
 
 
 @app.route("/api/v1/disconnect", methods=["POST"])

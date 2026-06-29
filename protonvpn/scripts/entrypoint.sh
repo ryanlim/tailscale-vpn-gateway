@@ -59,18 +59,29 @@ while true; do
 
     if [ "$UNHEALTHY" -ge "$UNHEALTHY_THRESHOLD" ]; then
         IFACE=$(cat "$ACTIVE_IFACE_FILE" 2>/dev/null || echo "$WG_IFACE")
-        CONF=$(find /etc/wireguard -name "${IFACE}.conf" 2>/dev/null | head -1)
-        CONF="${CONF:-/etc/wireguard/${IFACE}.conf}"
-        echo "Restarting WireGuard: $IFACE"
-        iptables-legacy  -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-        ip6tables-legacy -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
-        wg-quick down "${CONF:-$IFACE}" 2>/dev/null || true
-        sleep 2
-        wg-quick up "$CONF"
-        iptables-legacy  -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
-            || iptables-legacy  -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
-        ip6tables-legacy -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
-            || ip6tables-legacy -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE || true
+        echo "No egress — requesting reconnect (server rotation + local agent wait)..."
+        # Delegate to the Python app: it picks a different server in the same city,
+        # brings up WireGuard, and waits for local agent auth before returning.
+        # --max-time covers 75s server-side wait + overhead; -f treats HTTP errors as failure.
+        if curl -sf -X POST http://localhost/api/v1/reconnect \
+                --max-time 120 -o /tmp/reconnect_result.json 2>/dev/null; then
+            echo "Reconnect succeeded: $(cat /tmp/reconnect_result.json 2>/dev/null)"
+        else
+            # API unavailable (Python app not yet started) or returned an error.
+            # Fall back to direct wg-quick restart on the same interface.
+            echo "Reconnect API failed; falling back to direct wg-quick restart of $IFACE"
+            CONF=$(find /etc/wireguard -name "${IFACE}.conf" 2>/dev/null | head -1)
+            CONF="${CONF:-/etc/wireguard/${IFACE}.conf}"
+            iptables-legacy  -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+            ip6tables-legacy -t nat -D POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null || true
+            wg-quick down "${CONF:-$IFACE}" 2>/dev/null || true
+            sleep 2
+            wg-quick up "$CONF"
+            iptables-legacy  -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
+                || iptables-legacy  -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE
+            ip6tables-legacy -t nat -C POSTROUTING -o "$IFACE" -j MASQUERADE 2>/dev/null \
+                || ip6tables-legacy -t nat -A POSTROUTING -o "$IFACE" -j MASQUERADE || true
+        fi
         UNHEALTHY=0
     fi
 done
