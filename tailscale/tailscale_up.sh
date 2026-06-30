@@ -212,7 +212,7 @@ while true; do
   # a single slow/timed-out `tailscale status` call doesn't trigger a reconnect
   # that resets DERP sessions and disrupts connected clients.
   TS_STATE=$(timeout 10 tailscale status --json 2>/dev/null \
-    | grep -o '"BackendState":"[^"]*"' | cut -d'"' -f4)
+    | grep -o '"BackendState": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
   if [ "$TS_STATE" != "Running" ]; then
     TS_UNHEALTHY_COUNT=$((TS_UNHEALTHY_COUNT + 1))
     echo "tailscale BackendState=${TS_STATE:-unreachable} (count=${TS_UNHEALTHY_COUNT}/${TS_UNHEALTHY_THRESHOLD})"
