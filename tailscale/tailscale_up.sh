@@ -52,8 +52,9 @@ nohup python3 /gateway_api.py >/tmp/gateway_api.log 2>&1 &
 INSTANCE_NAME_=$(echo $INSTANCE_NAME | sed 's/_/-/g')
 
 # Number of consecutive watchdog cycles where VPN is up but egress is broken
-# before we kick tailscale. 20s per cycle, so 2 = ~40 seconds.
-UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-2}
+# before we kick tailscale. 20s per cycle, so 3 = ~60 seconds. Kept high to
+# give the ProtonVPN watchdog time to rotate servers before tailscale acts.
+UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
 
 # Egress probe: URLs the watchdog fetches to prove real internet connectivity
 # through the VPN tunnel (default route -> nordvpn-wg -> WireGuard). The probe
@@ -245,9 +246,11 @@ while true; do
   UNHEALTHY_COUNT=$((UNHEALTHY_COUNT + 1))
   echo "no egress while VPN+tailscale both report healthy (count=$UNHEALTHY_COUNT/$UNHEALTHY_THRESHOLD)"
   if [ "$UNHEALTHY_COUNT" -ge "$UNHEALTHY_THRESHOLD" ]; then
-    echo "kicking tailscale"
-    tailscale down 2>/dev/null
-    sleep 2
+    # Use `tailscale up` rather than `tailscale down`+`up`: the down step
+    # tears out all DERP sessions and iOS clients don't re-establish exit-node
+    # routing automatically. `tailscale up` reconfigures the daemon and
+    # re-registers with the control server without evicting connected clients.
+    echo "kicking tailscale (up only — preserving client sessions)"
     do_tailscale_up
     UNHEALTHY_COUNT=0
     # Cooldown: give tailscale time to re-establish the tunnel and exit-node
