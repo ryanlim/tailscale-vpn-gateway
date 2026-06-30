@@ -183,6 +183,8 @@ nginx -t && nginx
 nohup /usr/bin/node_exporter >/tmp/node_exporter.log 2>&1 &
 
 UNHEALTHY_COUNT=0
+TS_UNHEALTHY_COUNT=0
+TS_UNHEALTHY_THRESHOLD=${TS_UNHEALTHY_THRESHOLD:-2}
 while true; do
   sleep 20
   date
@@ -205,15 +207,26 @@ while true; do
   # Check BackendState regardless of VPN status. This catches NeedsLogin,
   # Stopped, and Starting — the exact states the user would otherwise have
   # to fix manually with `tailscale up` — without waiting for egress to fail.
+  # Require TS_UNHEALTHY_THRESHOLD consecutive bad readings before acting so
+  # a single slow/timed-out `tailscale status` call doesn't trigger a reconnect
+  # that resets DERP sessions and disrupts connected clients.
   TS_STATE=$(timeout 10 tailscale status --json 2>/dev/null \
     | grep -o '"BackendState":"[^"]*"' | cut -d'"' -f4)
   if [ "$TS_STATE" != "Running" ]; then
-    echo "tailscale BackendState=${TS_STATE:-unreachable}; running tailscale up"
+    TS_UNHEALTHY_COUNT=$((TS_UNHEALTHY_COUNT + 1))
+    echo "tailscale BackendState=${TS_STATE:-unreachable} (count=${TS_UNHEALTHY_COUNT}/${TS_UNHEALTHY_THRESHOLD})"
+    if [ "$TS_UNHEALTHY_COUNT" -lt "$TS_UNHEALTHY_THRESHOLD" ]; then
+      continue
+    fi
+    echo "tailscale persistently not Running; running tailscale up"
     do_tailscale_up
+    TS_UNHEALTHY_COUNT=0
     UNHEALTHY_COUNT=0
     sleep 30
     continue
   fi
+
+  TS_UNHEALTHY_COUNT=0
 
   # Tailscale is Running. Only check egress when the VPN backend is also
   # Connected — if the VPN is down or mid-reconnect, egress failure is not
