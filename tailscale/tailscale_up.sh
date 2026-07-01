@@ -186,6 +186,8 @@ nohup /usr/bin/node_exporter >/tmp/node_exporter.log 2>&1 &
 UNHEALTHY_COUNT=0
 TS_UNHEALTHY_COUNT=0
 TS_UNHEALTHY_THRESHOLD=${TS_UNHEALTHY_THRESHOLD:-2}
+NETMAP_UNHEALTHY_COUNT=0
+NETMAP_UNHEALTHY_THRESHOLD=${NETMAP_UNHEALTHY_THRESHOLD:-2}
 while true; do
   sleep 20
   date
@@ -211,7 +213,8 @@ while true; do
   # Require TS_UNHEALTHY_THRESHOLD consecutive bad readings before acting so
   # a single slow/timed-out `tailscale status` call doesn't trigger a reconnect
   # that resets DERP sessions and disrupts connected clients.
-  TS_STATE=$(timeout 10 tailscale status --json 2>/dev/null \
+  TS_JSON=$(timeout 10 tailscale status --json 2>/dev/null)
+  TS_STATE=$(echo "$TS_JSON" \
     | grep -o '"BackendState": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
   if [ "$TS_STATE" != "Running" ]; then
     TS_UNHEALTHY_COUNT=$((TS_UNHEALTHY_COUNT + 1))
@@ -223,11 +226,35 @@ while true; do
     do_tailscale_up
     TS_UNHEALTHY_COUNT=0
     UNHEALTHY_COUNT=0
+    NETMAP_UNHEALTHY_COUNT=0
     sleep 30
     continue
   fi
 
   TS_UNHEALTHY_COUNT=0
+
+  # BackendState can be "Running" while tailscaled has stopped receiving
+  # netmap updates from the coordination server (control-plane session
+  # stale, e.g. after a network blip that killed the long-lived HTTPS
+  # session but not the daemon). Peers learn this node's liveness from the
+  # coordination server, not from us, so a stale netmap here means other
+  # tailnet clients see this node as unreachable even though BackendState
+  # and egress both look fine. `tailscale up` is idempotent and re-registers
+  # with the control server, same recovery as the BackendState check above.
+  if echo "$TS_JSON" | grep -q "received a network map from the coordination server"; then
+    NETMAP_UNHEALTHY_COUNT=$((NETMAP_UNHEALTHY_COUNT + 1))
+    echo "tailscale netmap stale (count=${NETMAP_UNHEALTHY_COUNT}/${NETMAP_UNHEALTHY_THRESHOLD})"
+    if [ "$NETMAP_UNHEALTHY_COUNT" -ge "$NETMAP_UNHEALTHY_THRESHOLD" ]; then
+      echo "tailscale netmap persistently stale; running tailscale up"
+      do_tailscale_up
+      NETMAP_UNHEALTHY_COUNT=0
+      UNHEALTHY_COUNT=0
+      sleep 30
+      continue
+    fi
+  else
+    NETMAP_UNHEALTHY_COUNT=0
+  fi
 
   # Tailscale is Running. Only check egress when the VPN backend is also
   # Connected — if the VPN is down or mid-reconnect, egress failure is not
