@@ -52,7 +52,7 @@ nohup python3 /gateway_api.py >/tmp/gateway_api.log 2>&1 &
 INSTANCE_NAME_=$(echo $INSTANCE_NAME | sed 's/_/-/g')
 
 # Number of consecutive watchdog cycles where VPN is up but egress is broken
-# before we kick tailscale. 20s per cycle, so 3 = ~60 seconds. Kept high to
+# before we kick tailscale. 10s per cycle, so 3 = ~30 seconds. Kept high to
 # give the ProtonVPN watchdog time to rotate servers before tailscale acts.
 UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
 
@@ -61,8 +61,11 @@ UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
 # passes if ANY URL responds, so a single provider blip won't trip it. The
 # first is an IP literal (no DNS) so a DNS-only fault — which kicking tailscale
 # can't fix — won't trigger a kick; the second also exercises DNS resolution.
+# Timeout is kept well under the 10s loop interval so a real outage doesn't
+# let the check itself eat the whole cycle (has_egress tries both URLs in the
+# worst case, so keep this at roughly interval/2 or less).
 EGRESS_CHECK_URLS="${EGRESS_CHECK_URLS:-http://1.1.1.1/ http://www.gstatic.com/generate_204}"
-EGRESS_CHECK_TIMEOUT="${EGRESS_CHECK_TIMEOUT:-8}"
+EGRESS_CHECK_TIMEOUT="${EGRESS_CHECK_TIMEOUT:-4}"
 
 do_tailscale_up() {
   # Always pass --auth-key when TAILSCALE_AUTH_KEY is set: tailscale uses it
@@ -203,7 +206,7 @@ TS_UNHEALTHY_THRESHOLD=${TS_UNHEALTHY_THRESHOLD:-2}
 CONTROL_UNHEALTHY_COUNT=0
 CONTROL_UNHEALTHY_THRESHOLD=${CONTROL_UNHEALTHY_THRESHOLD:-2}
 while true; do
-  sleep 20
+  sleep 10
   date
 
   pidof tailscaled >/dev/null || tailscaled &
@@ -242,7 +245,7 @@ while true; do
   # known-benign "peers advertising routes" advisory, so any *new* warning
   # tailscaled starts emitting is treated as actionable by default instead
   # of silently ignored until someone notices and adds a pattern for it.
-  TS_JSON=$(timeout 10 tailscale status --json 2>/dev/null)
+  TS_JSON=$(timeout 5 tailscale status --json 2>/dev/null)
   TS_PARSED=$(echo "$TS_JSON" | python3 -c '
 import json, sys
 BENIGN_HEALTH_SUBSTRINGS = ("--accept-routes",)
