@@ -65,13 +65,7 @@
 
             <!-- Server selector + connect -->
             <form class="mb-2" onsubmit="handleSubmit(event, 'connect');">
-                <div class="d-flex align-items-center mb-1" id="serverLabelRow">
-                    <label for="serverSelect" class="form-label text-muted small mb-0 me-auto">Server</label>
-                    <button type="button" class="refresh-btn" id="configRefreshBtn"
-                            title="Re-download configs from Proton" aria-label="Refresh server configs"
-                            onclick="refreshServerConfigs()">↻</button>
-                    <span id="configRefreshMsg" class="text-muted small ms-1" style="font-size:.75rem"></span>
-                </div>
+                <label for="serverSelect" class="form-label text-muted small mb-1">Server</label>
                 <select class="form-select mb-2" id="serverSelect" name="server"></select>
                 <button class="btn btn-success w-100" type="submit" id="connectBtn">Connect to VPN</button>
             </form>
@@ -92,11 +86,13 @@
                 </div>
                 <!-- Status row -->
                 <div class="d-flex justify-content-between align-items-center">
-                    <small class="text-muted">Credentials</small>
+                    <small class="text-muted">Account</small>
                     <div class="d-flex align-items-center gap-2">
                         <span id="credBadge" class="badge bg-secondary">—</span>
                         <button type="button" class="btn btn-outline-secondary btn-sm"
                                 onclick="showLoginModal()">Re-authenticate</button>
+                        <button type="button" class="btn btn-outline-secondary btn-sm" id="configRefreshBtn"
+                                onclick="refreshServerConfigs()">Refresh configs</button>
                     </div>
                 </div>
             </div>
@@ -271,23 +267,19 @@
             });
     }
 
-    // [backend key, display label, alwaysShow]
-    // alwaysShow=true: render the row even when the value is absent, showing "—".
     const STATUS_FIELDS = [
-        ['Country',            'Country',        false],
-        ['City',               'City',           false],
-        ['Hostname',           'Hostname',       false],
-        ['Endpoint',           'Endpoint',       false],
-        ['Load',               'Load',           false],
-        ['Technology',         'Technology',     false],
-        ['Current technology', 'Technology',     false],
-        ['Current protocol',   'Protocol',       false],
-        ['Uptime',             'Uptime',         false],
-        ['Latest handshake',   'Last handshake', false],
-        ['Received',           'Received',       false],
-        ['Sent',               'Sent',           false],
-        ['Public IPv4',        'Public IPv4',    true ],
-        ['Public IPv6',        'Public IPv6',    true ],
+        ['Country',            'Country'],
+        ['City',               'City'],
+        ['Hostname',           'Hostname'],
+        ['Endpoint',           'Endpoint'],
+        ['Load',               'Load'],
+        ['Technology',         'Technology'],
+        ['Current technology', 'Technology'],
+        ['Current protocol',   'Protocol'],
+        ['Uptime',             'Uptime'],
+        ['Latest handshake',   'Last handshake'],
+        ['Received',           'Received'],
+        ['Sent',               'Sent'],
     ];
 
     function refreshIPs() {
@@ -325,20 +317,14 @@
 
         const fields    = data.fields || {};
         const connected = data.status === 'Connected';
-        let   ipRefreshBtnAdded = false;
 
-        STATUS_FIELDS.forEach(([key, label, alwaysShow]) => {
-            const value   = fields[key];
+        function addRow(label, value, bold = true) {
             const isEmpty = value === undefined || value === null || value === '';
-            // alwaysShow rows only appear when connected (no point showing IP rows
-            // when disconnected), but stay visible while IPs are still resolving.
-            if (isEmpty && (!alwaysShow || !connected)) return;
-
             const row = document.createElement('tr');
             const th  = document.createElement('th');
             const td  = document.createElement('td');
             th.scope = 'row';
-            th.className = 'text-muted fw-normal';
+            th.className = 'text-muted ' + (bold ? 'fw-bold' : 'fw-normal');
             th.style.width = '40%';
             th.textContent = label;
             td.className = 'font-monospace small';
@@ -352,24 +338,48 @@
                 td.textContent = value;
             }
 
-            // Add a single ↻ button on the first IP row so the user can force
-            // a re-lookup after a failed or stale resolution.
-            if (alwaysShow && !ipRefreshBtnAdded) {
-                ipRefreshBtnAdded = true;
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.className = 'refresh-btn ms-1' + (_ipRefreshInProgress ? ' spinning' : '');
-                btn.title = 'Refresh IP lookups';
-                btn.setAttribute('aria-label', 'Refresh IP lookups');
-                btn.textContent = '↻';
-                btn.addEventListener('click', refreshIPs);
-                th.appendChild(btn);
-            }
-
             row.appendChild(th);
             row.appendChild(td);
             tbody.appendChild(row);
+            return { row, th, td };
+        }
+
+        STATUS_FIELDS.forEach(([key, label]) => {
+            const value = fields[key];
+            if (value === undefined || value === null || value === '') return;
+            addRow(label, value);
         });
+
+        // Public IPv4/IPv6 are collapsed into a "Public IP addresses" section
+        // with a single refresh button on the header, rather than one per row.
+        // The section (and its rows) only appears when connected, but stays
+        // visible while the IPs are still resolving.
+        if (connected) {
+            const headerRow  = document.createElement('tr');
+            const headerCell = document.createElement('td');
+            headerCell.colSpan = 2;
+            const headerWrap = document.createElement('div');
+            headerWrap.className = 'd-flex align-items-center justify-content-between text-muted';
+            const headerLabel = document.createElement('span');
+            headerLabel.className = 'fw-bold';
+            headerLabel.textContent = 'Public IP addresses';
+            const headerBtn = document.createElement('button');
+            headerBtn.type = 'button';
+            headerBtn.className = 'refresh-btn' + (_ipRefreshInProgress ? ' spinning' : '');
+            headerBtn.title = 'Refresh IP lookups';
+            headerBtn.setAttribute('aria-label', 'Refresh IP lookups');
+            headerBtn.textContent = '↻';
+            headerBtn.addEventListener('click', refreshIPs);
+            headerWrap.appendChild(headerLabel);
+            headerWrap.appendChild(headerBtn);
+            headerCell.appendChild(headerWrap);
+            headerRow.appendChild(headerCell);
+            tbody.appendChild(headerRow);
+
+            addRow('IPv4', fields['Public IPv4'], false);
+            addRow('IPv6', fields['Public IPv6'], false);
+        }
+
         statusTable.classList.toggle('d-none', tbody.children.length === 0);
 
         statusText.textContent = `Status: ${data.status}`;
@@ -399,9 +409,9 @@
             btn.textContent = 'Connect to VPN';
             btn.className = 'btn btn-success w-100';
         } else if (connectedCode === selected) {
-            btn.disabled = true;
-            btn.textContent = 'Already connected';
-            btn.className = 'btn btn-secondary w-100';
+            btn.disabled = false;
+            btn.textContent = 'Reconnect';
+            btn.className = 'btn btn-warning w-100';
         } else {
             btn.disabled = false;
             btn.textContent = 'Reconnect to selected endpoint';
@@ -749,18 +759,22 @@
         // Config refresh (re-download WireGuard configs from Proton)
         window.refreshServerConfigs = function() {
             const btn = document.getElementById('configRefreshBtn');
-            const msg = document.getElementById('configRefreshMsg');
-            if (!currentBackend || btn.classList.contains('spinning')) return;
+            if (!currentBackend || btn.disabled) return;
 
-            btn.classList.add('spinning');
-            msg.textContent = 'Starting…';
+            function reset() {
+                btn.disabled = false;
+                btn.textContent = 'Refresh configs';
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Refreshing…';
 
             timedFetch(backendApi('servers/refresh'), {method: 'POST'}, 8000)
                 .then(r => r.json().then(d => ({ok: r.ok, d})))
                 .then(({ok, d}) => {
                     if (!ok && d.error) {
-                        btn.classList.remove('spinning');
-                        msg.textContent = d.error;
+                        reset();
+                        showToast('Error: ' + d.error, true);
                         return;
                     }
                     // Poll until done
@@ -769,27 +783,25 @@
                             .then(r => r.json())
                             .then(s => {
                                 if (s.state === 'running') {
-                                    msg.textContent = s.message || 'Running…';
                                     setTimeout(poll, 2000);
                                 } else if (s.state === 'done') {
-                                    btn.classList.remove('spinning');
-                                    msg.textContent = 'Done ✓';
-                                    setTimeout(() => { msg.textContent = ''; }, 5000);
+                                    reset();
+                                    showToast('Server configs refreshed.');
                                     loadServers();
                                 } else {
-                                    btn.classList.remove('spinning');
-                                    msg.textContent = 'Error: ' + (s.message || s.state);
+                                    reset();
+                                    showToast('Error: ' + (s.message || s.state), true);
                                 }
                             })
                             .catch(() => {
-                                btn.classList.remove('spinning');
-                                msg.textContent = 'Poll error';
+                                reset();
+                                showToast('Poll error', true);
                             });
                     })();
                 })
                 .catch(err => {
-                    btn.classList.remove('spinning');
-                    msg.textContent = 'Error: ' + err.message;
+                    reset();
+                    showToast('Error: ' + err.message, true);
                 });
         };
 
