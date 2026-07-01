@@ -1,4 +1,8 @@
-FROM tailscale/tailscale:latest
+# Pinned rather than :latest — the base image was silently stuck on 1.94.2
+# for weeks because Docker only re-resolves a FROM tag against the registry
+# when explicitly told to (docker pull / --pull), so a floating tag doesn't
+# actually keep you current without deliberate action. Bump this by hand.
+FROM tailscale/tailscale:v1.98.4
 
 # Pre-install the auxiliary tools the entrypoint relies on (nginx for the
 # reverse proxy to the control panel — terminating optional HTTPS, curl
