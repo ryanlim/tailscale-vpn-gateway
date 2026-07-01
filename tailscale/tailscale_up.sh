@@ -89,13 +89,27 @@ is_vpn_connected() {
   local gw response
   gw=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
   response=$(curl -fsS --max-time 5 "http://${gw}/api/v1/status" 2>/dev/null) || return 1
-  echo "$response" | grep -q '"status": *"Connected"' || return 1
-  # Defer while ProtonVPN's local agent is mid-auth. The WireGuard handshake
-  # succeeds immediately but the server blocks forwarding until the TLS auth
-  # completes — kicking tailscale here can't help and would mask the real cause.
-  # "disconnected" = cert absent (free tier) so no auth needed; treat as ready.
-  echo "$response" | grep -q '"local_agent": *"connecting"' && return 1
-  return 0
+  # Real JSON parsing rather than a key:value regex — a prior version of this
+  # matched `"status": *"Connected"` and broke when the backend's JSON
+  # serializer changed its key/value spacing. python3 is already a hard
+  # dependency (gateway_api.py below), so use it instead of re-deriving a
+  # regex every time the wire format shifts.
+  echo "$response" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if d.get("status") != "Connected":
+    sys.exit(1)
+# Defer while the local agent is mid-auth. The WireGuard handshake succeeds
+# immediately but the server blocks forwarding until TLS auth completes —
+# kicking tailscale here cant help and would mask the real cause.
+# "disconnected" = cert absent (free tier) so no auth needed; treat as ready.
+if d.get("local_agent") == "connecting":
+    sys.exit(1)
+sys.exit(0)
+'
 }
 
 
@@ -213,9 +227,40 @@ while true; do
   # Require TS_UNHEALTHY_THRESHOLD consecutive bad readings before acting so
   # a single slow/timed-out `tailscale status` call doesn't trigger a reconnect
   # that resets DERP sessions and disrupts connected clients.
+  #
+  # Everything below is parsed via real JSON (python3, already a hard
+  # dependency for gateway_api.py) rather than grepping for specific field
+  # text. We've twice been bitten by matching exact wording — first
+  # BackendState's key/value spacing, then one specific phrasing of a
+  # control-plane warning out of several tailscaled actually emits for the
+  # same underlying failure — so an unfamiliar-but-real warning silently
+  # passed the watchdog for hours. TS_ONLINE reads Self.Online directly:
+  # it's the same structured field peers use to decide whether this node is
+  # reachable, so it can't drift out of sync with new/reworded Health text
+  # the way a message-matching regex can. TS_ACTIONABLE is a denylist, not
+  # an allowlist: it counts every Health entry except the one specific,
+  # known-benign "peers advertising routes" advisory, so any *new* warning
+  # tailscaled starts emitting is treated as actionable by default instead
+  # of silently ignored until someone notices and adds a pattern for it.
   TS_JSON=$(timeout 10 tailscale status --json 2>/dev/null)
-  TS_STATE=$(echo "$TS_JSON" \
-    | grep -o '"BackendState": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+  TS_PARSED=$(echo "$TS_JSON" | python3 -c '
+import json, sys
+BENIGN_HEALTH_SUBSTRINGS = ("--accept-routes",)
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    d = {}
+state = d.get("BackendState") or "unreachable"
+online = bool((d.get("Self") or {}).get("Online"))
+health = d.get("Health") or []
+actionable = [h for h in health if not any(b in h for b in BENIGN_HEALTH_SUBSTRINGS)]
+print(state)
+print("true" if online else "false")
+print(len(actionable))
+')
+  TS_STATE=$(echo "$TS_PARSED" | sed -n 1p)
+  TS_ONLINE=$(echo "$TS_PARSED" | sed -n 2p)
+  TS_ACTIONABLE=$(echo "$TS_PARSED" | sed -n 3p)
   if [ "$TS_STATE" != "Running" ]; then
     TS_UNHEALTHY_COUNT=$((TS_UNHEALTHY_COUNT + 1))
     echo "tailscale BackendState=${TS_STATE:-unreachable} (count=${TS_UNHEALTHY_COUNT}/${TS_UNHEALTHY_THRESHOLD})"
@@ -234,21 +279,20 @@ while true; do
   TS_UNHEALTHY_COUNT=0
 
   # BackendState can be "Running" while tailscaled's session to the
-  # coordination server is broken (stale netmap, "unable to connect to
-  # synchronize", etc. — tailscaled has emitted several differently-worded
-  # Health strings for this over time, e.g. after a network blip that killed
-  # the long-lived control HTTPS request but not the daemon). Match on the
-  # "coordination server" substring common to all of them rather than one
-  # exact message, since peers learn this node's liveness from the
-  # coordination server, not from us — any of these mean other tailnet
-  # clients see this node as unreachable even though BackendState and egress
-  # both look fine. `tailscale up` is idempotent and re-registers with the
-  # control server, same recovery as the BackendState check above.
-  if echo "$TS_JSON" | grep -q "coordination server"; then
+  # coordination server is broken (e.g. after a network blip that killed the
+  # long-lived control HTTPS request but not the daemon). Peers learn this
+  # node's liveness from the coordination server, not from us, so this means
+  # other tailnet clients see this node as unreachable even though
+  # BackendState and egress both look fine. React if the control server
+  # doesn't consider us online, OR if there's any Health warning beyond the
+  # one known-benign one (see the parser above) — `tailscale up` is
+  # idempotent and re-registers with the control server, same recovery as
+  # the BackendState check above.
+  if [ "$TS_ONLINE" != "true" ] || [ "${TS_ACTIONABLE:-0}" -gt 0 ]; then
     CONTROL_UNHEALTHY_COUNT=$((CONTROL_UNHEALTHY_COUNT + 1))
-    echo "tailscale control-plane session unhealthy (count=${CONTROL_UNHEALTHY_COUNT}/${CONTROL_UNHEALTHY_THRESHOLD})"
+    echo "tailscale control-plane unhealthy (online=$TS_ONLINE actionable_health=$TS_ACTIONABLE) (count=${CONTROL_UNHEALTHY_COUNT}/${CONTROL_UNHEALTHY_THRESHOLD})"
     if [ "$CONTROL_UNHEALTHY_COUNT" -ge "$CONTROL_UNHEALTHY_THRESHOLD" ]; then
-      echo "tailscale control-plane session persistently unhealthy; running tailscale up"
+      echo "tailscale control-plane persistently unhealthy; running tailscale up"
       do_tailscale_up
       CONTROL_UNHEALTHY_COUNT=0
       UNHEALTHY_COUNT=0
