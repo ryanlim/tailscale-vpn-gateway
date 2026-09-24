@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>VPN Control Panel</title>
+    {% if favicon_file_available %}
+    <link rel="icon" href="{{ url_for('favicon') }}">
+    {% endif %}
     <script>
         // Apply the theme before rendering to avoid a light-theme flash.
         (() => {
