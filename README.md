@@ -58,6 +58,12 @@ The panel is reachable at `http://<tailscale-hostname>/` and
 provided, HTTPS is served with a self-signed cert (browser warning is
 expected; see *TLS* below).
 
+The control-panel favicon files are provided by `control-panel/favicon/` and
+mounted into the container as `/app/favicon/`. The panel uses the first
+available file in this order: `favicon.svg`, `favicon.png`, `favicon.jpg`.
+Place one of these files there to use a custom favicon; no `.env` setting is
+required.
+
 ## Configuration
 
 ### `.env`

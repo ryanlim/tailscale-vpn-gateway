@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = Path(os.environ.get("BACKENDS_CONFIG", "/config/backends.json"))
 TAILSCALE_GATEWAY_URL = os.environ.get("TAILSCALE_GATEWAY_URL", "").rstrip("/")
+FAVICON_FILES = tuple(
+    Path("/app/favicon") / filename
+    for filename in ("favicon.svg", "favicon.png", "favicon.jpg")
+)
 
 # Persistent HTTP session to the gateway API — reuses the TCP connection
 # across calls so there's no handshake overhead on every switch or poll.
@@ -88,7 +92,22 @@ def backend_host(backend: dict) -> str:
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        favicon_file_available=find_favicon() is not None,
+    )
+
+
+def find_favicon() -> Path | None:
+    return next((path for path in FAVICON_FILES if path.is_file()), None)
+
+
+@app.route("/favicon")
+def favicon():
+    favicon_file = find_favicon()
+    if favicon_file is None:
+        return Response(status=404)
+    return send_file(favicon_file)
 
 
 @app.route("/api/v1/backends", methods=["GET"])
