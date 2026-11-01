@@ -28,8 +28,29 @@ except ImportError:
     print("ERROR: proton-vpn-session not installed.", file=sys.stderr)
     sys.exit(1)
 
+try:
+    from proton.vpn.core.session_holder import ClientTypeMetadata, SessionHolder
+except ImportError:
+    ClientTypeMetadata = SessionHolder = None
+
 _SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CERT_DIR = _SCRIPT_DIR.parent / "wireguard" / "proton_auth"
+
+
+def _client_identity() -> tuple[str, str] | None:
+    """The x-pm-appversion / User-Agent the official Proton VPN client sends.
+
+    The session was created by that client, and Proton ties refresh tokens to the
+    client identity, so the backend must renew it with the same strings.  A bare
+    ProtonSSO() reports the library defaults ("Other"/"None") instead.
+    """
+    if SessionHolder is None:
+        return None
+    try:
+        sso = SessionHolder(ClientTypeMetadata(type="cli"))._proton_sso
+        return sso._appversion, sso._user_agent
+    except Exception:  # private attrs may change between releases
+        return None
 
 
 def main() -> None:
@@ -51,12 +72,14 @@ def main() -> None:
         sys.exit(1)
 
     state = sess.__getstate__()
+    identity = _client_identity()
+    last_use = state.get("LastUseData", {})
     creds = {
         "uid":           state["UID"],
         "access_token":  state["AccessToken"],
         "refresh_token": state["RefreshToken"],
-        "appversion":    state.get("LastUseData", {}).get("appversion", "Other"),
-        "user_agent":    state.get("LastUseData", {}).get("user_agent", "None"),
+        "appversion":    identity[0] if identity else last_use.get("appversion", "Other"),
+        "user_agent":    identity[1] if identity else last_use.get("user_agent", "None"),
     }
 
     args.cert_dir.mkdir(parents=True, exist_ok=True)

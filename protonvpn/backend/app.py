@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """ProtonVPN WireGuard backend — implements the BACKEND_API v1 contract."""
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -18,7 +19,6 @@ import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-import proton_srp
 
 app = Flask(__name__)
 CORS(app)
@@ -98,20 +98,6 @@ PROTON_API_BASE      = "https://vpn-api.proton.me"
 CREDENTIALS_FILE     = WG_DIR / "proton_auth" / "credentials.json"
 CERT_REFRESH_AHEAD   = 48 * 3600  # refresh when fewer than 48 h remain
 CERT_CHECK_INTERVAL  = 6 * 3600   # poll every 6 hours
-
-# App headers sent during login (match what extract_credentials.py produces)
-PROTON_APP_VERSION = "linux-vpn-cli@5.2.5+x86-64"
-PROTON_USER_AGENT  = "ProtonVPN/5.2.5 (Linux; ubuntu/24.04)"
-
-# Auth API base — separate from the VPN API base used for cert operations.
-# download_wg_configs.py authenticates here successfully; vpn-api.proton.me
-# is only used for post-auth operations (cert refresh, certificate fetch).
-PROTON_AUTH_BASE = "https://api.protonvpn.ch"
-
-# In-memory store for partial 2FA sessions {token: {uid, access_token, refresh_token, expires}}
-_pending_2fa: dict[str, dict] = {}
-_PENDING_2FA_TTL = 300  # 5 minutes
-
 
 class _LocalAgent:
     """Maintain TLS connection to ProtonVPN local agent (10.2.0.1:65432).
@@ -300,8 +286,30 @@ class _CertRefresher:
             "Authorization": f"Bearer {creds['access_token']}",
         }
 
+    # "rejected" (Proton refused the token) or "network" (couldn't reach Proton)
+    last_refresh_failure: str | None = None
+
+    # Proton rotates the refresh token on every use and may revoke the session if a
+    # rotated-away token is presented again.  Refreshes therefore must never run
+    # concurrently, and each must start from the newest token on disk.
+    _refresh_lock = threading.Lock()
+
+    @staticmethod
+    def _fp(token: str) -> str:
+        """Short non-reversible fingerprint of a token, safe to log."""
+        return hashlib.sha256(token.encode()).hexdigest()[:8]
+
     def _refresh_token(self, creds: dict) -> dict | None:
-        """Exchange the refresh token for a new access token. Returns updated creds or None."""
+        """Exchange the refresh token for a new access token. Returns updated creds or None.
+        On failure, last_refresh_failure says whether Proton rejected it or was unreachable."""
+        with self._refresh_lock:
+            latest = self._load_creds()
+            if latest and latest.get("uid") == creds.get("uid"):
+                creds = latest  # another thread may have rotated the token since the caller read it
+            return self._refresh_token_locked(creds)
+
+    def _refresh_token_locked(self, creds: dict) -> dict | None:
+        self.last_refresh_failure = None
         try:
             r = requests.post(
                 f"{PROTON_API_BASE}/auth/refresh",
@@ -318,15 +326,21 @@ class _CertRefresher:
                 },
                 timeout=15,
             )
+            old_fp = self._fp(creds["refresh_token"])
             if r.ok:
                 data = r.json()
                 creds = {**creds, "access_token": data["AccessToken"], "refresh_token": data["RefreshToken"]}
                 self._save_creds(creds)
-                logger.info("cert-refresher: access token refreshed")
+                logger.info("cert-refresher: access token refreshed (refresh token %s -> %s)",
+                            old_fp, self._fp(creds["refresh_token"]))
                 return creds
-            logger.warning("cert-refresher: token refresh HTTP %s — re-run extract_credentials.py", r.status_code)
+            logger.warning("cert-refresher: token refresh HTTP %s (refresh token %s): %s — "
+                           "re-run headless_extract_credentials.sh",
+                           r.status_code, old_fp, r.text[:300])
+            self.last_refresh_failure = "network" if r.status_code >= 500 else "rejected"
         except Exception as exc:
             logger.warning("cert-refresher: token refresh error: %s", exc)
+            self.last_refresh_failure = "network"
         return None
 
     def _get_pubkey_pem(self) -> str | None:
@@ -1327,10 +1341,10 @@ def proton_refresh_cert():
     regeneration or any time the cert and the gateway mapping are out of sync.
 
     Body (optional): {"reconnect": true|false}  — default true.
-    Requires credentials.json to be present (log in via /proton/login first).
+    Requires credentials.json to be present (create it with scripts/headless_extract_credentials.sh).
     """
     if _cert_refresher._load_creds() is None:
-        return jsonify({"error": "credentials.json missing — log in first"}), 400
+        return jsonify({"error": f"credentials.json missing — {_RELOGIN_HINT}"}), 400
     data = request.get_json(silent=True) or {}
     do_reconnect = data.get("reconnect", True)
 
@@ -1373,9 +1387,31 @@ def _run_servers_refresh() -> None:
         if creds is None:
             with _refresh_lock:
                 _refresh_status = {"state": "error",
-                                   "message": "credentials.json missing — log in first",
+                                   "message": f"No Proton session — {_RELOGIN_HINT}",
                                    "started": _refresh_status["started"]}
             return
+
+        # The stored access token is short-lived; exchange the refresh token for
+        # a fresh one first, otherwise /vpn/logicals returns 401.
+        refreshed = None
+        for attempt in range(4):
+            refreshed = _cert_refresher._refresh_token(creds)
+            if refreshed is not None or _cert_refresher.last_refresh_failure != "network":
+                break
+            time.sleep(5)  # DNS/tunnel blips (e.g. during a server rotation)
+        if refreshed is None:
+            network = _cert_refresher.last_refresh_failure == "network"
+            if not network:
+                _session_check_reset(False)
+            msg = ("Can't reach Proton right now (network/DNS) — try again in a moment"
+                   if network else
+                   f"Proton session expired — {_RELOGIN_HINT}")
+            with _refresh_lock:
+                _refresh_status = {"state": "error", "message": msg,
+                                   "started": _refresh_status["started"]}
+            return
+        _session_check_reset(True)
+        creds = refreshed
 
         privkey = _extract_private_key()
         if privkey is None:
@@ -1457,26 +1493,95 @@ def public_ip():
 
 # --- Credential management ----------------------------------------------------
 
+# Shown wherever the Proton session is missing/expired.  The panel cannot log in
+# itself (Proton demands a CAPTCHA that only its own sites may display).
+_RELOGIN_HINT = "sign in again on the host (see \"How to fix\")"
+
+
+# Portal-key mode has no certificate, but "Refresh configs" still needs a valid
+# Proton session.  Validate it by exchanging the refresh token, at most once per
+# _SESSION_CHECK_TTL, and cache the result.  Reset when refreshes succeed or fail.
+_SESSION_CHECK_TTL = 3600
+_session_check: dict = {"ok": None, "at": 0.0, "mtime": None, "running": False}
+_session_check_lock = threading.Lock()
+
+
+def _creds_mtime() -> float | None:
+    try:
+        return CREDENTIALS_FILE.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _session_check_reset(ok: bool | None = None) -> None:
+    with _session_check_lock:
+        _session_check.update(ok=ok, at=time.time() if ok is not None else 0.0,
+                              mtime=_creds_mtime())
+
+
+def _session_check_bg() -> None:
+    try:
+        creds = _cert_refresher._load_creds()
+        if creds is not None:
+            if _cert_refresher._refresh_token(creds) is not None:
+                _session_check_reset(True)
+            elif _cert_refresher.last_refresh_failure == "network":
+                # Proton unreachable (e.g. tunnel still coming up): not an expired
+                # session.  Leave the result unknown so the next poll retries.
+                _session_check_reset(None)
+            else:
+                _session_check_reset(False)
+    finally:
+        with _session_check_lock:
+            _session_check["running"] = False
+
+
+def _session_ok() -> bool | None | str:
+    """True/False if the saved Proton session is valid, None if there is none,
+    "checking" while the first validation is in flight.  Never blocks on Proton:
+    a stale result is served while a refresh runs in the background."""
+    if _cert_refresher._load_creds() is None:
+        return None
+    with _session_check_lock:
+        # Also stale when credentials.json was replaced externally (e.g. by
+        # extract_credentials.py); our own saves update "mtime" via the reset.
+        stale = (_session_check["ok"] is None
+                 or time.time() - _session_check["at"] > _SESSION_CHECK_TTL
+                 or _session_check["mtime"] != _creds_mtime())
+        if stale and not _session_check["running"]:
+            _session_check["running"] = True
+            threading.Thread(target=_session_check_bg, daemon=True, name="session-check").start()
+        ok = _session_check["ok"]
+    return "checking" if ok is None else ok
+
+
 @app.route("/api/v1/proton/credential-status")
 def credential_status():
     """Report the health of credentials.json and client.pem."""
     if not USE_LOCAL_AGENT:
-        # Portal-key mode: no certificate or login to manage. Return 404 so the
-        # control panel hides the credential section entirely instead of showing
-        # a (meaningless) cert-expiry warning and prompting for a ProtonVPN login.
-        return jsonify({"status": "disabled",
-                        "message": "Portal key mode — no certificate needed"}), 404
+        # Portal-key mode: no certificate to manage, but the saved Proton login is
+        # still used by "Refresh configs", so report on that.
+        ok = _session_ok()
+        if ok == "checking":
+            return jsonify({"status": "checking", "message": "Checking Proton session…"})
+        if ok is None:
+            return jsonify({"status": "warning",
+                            "message": f"No Proton session — {_RELOGIN_HINT}"})
+        if not ok:
+            return jsonify({"status": "error",
+                            "message": f"Proton session expired — {_RELOGIN_HINT}"})
+        return jsonify({"status": "ok", "message": "Proton session valid"})
     creds = _cert_refresher._load_creds()
     remaining = _cert_refresher._cert_seconds_remaining()
 
     if creds is None:
-        return jsonify({"status": "warning", "message": "credentials.json missing — log in to enable certificate refresh"})
+        return jsonify({"status": "warning", "message": f"credentials.json missing — {_RELOGIN_HINT}"})
 
     if remaining is None:
         return jsonify({"status": "warning", "message": "Client certificate not yet provisioned — refresh will run within 6 h"})
 
     if remaining <= 0:
-        return jsonify({"status": "error", "message": "Client certificate has expired — log in again"})
+        return jsonify({"status": "error", "message": f"Client certificate has expired — {_RELOGIN_HINT}"})
 
     if remaining < CERT_REFRESH_AHEAD:
         h = int(remaining / 3600)
@@ -1484,192 +1589,6 @@ def credential_status():
 
     days = remaining / 86400
     return jsonify({"status": "ok", "message": f"Certificate valid for {days:.1f} days"})
-
-
-def _b64d(s: str) -> bytes:
-    """Decode a base-64 string that may be missing padding."""
-    pad = (4 - len(s) % 4) % 4
-    return base64.b64decode(s + "=" * pad)
-
-
-def _login_headers(uid: str | None = None, token: str | None = None) -> dict:
-    h = {
-        "x-pm-appversion": PROTON_APP_VERSION,
-        "x-pm-apiversion": "3",
-        "User-Agent":      PROTON_USER_AGENT,
-        "Accept":          "application/json",
-        "Content-Type":    "application/json",
-    }
-    if uid:
-        h["x-pm-uid"] = uid
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-    return h
-
-
-@app.route("/api/v1/proton/login", methods=["POST"])
-def proton_login():
-    """Authenticate with ProtonVPN via SRP and write credentials.json.
-
-    Body: {"username": "...", "password": "..."}
-
-    If the account has 2FA enabled, returns {"needs_2fa": true, "session_token": "..."}
-    and expects a follow-up POST to /api/v1/proton/login/2fa.
-    """
-    data     = request.get_json(silent=True) or {}
-    username = (data.get("username") or "").strip()
-    password = data.get("password") or ""
-    if not username or not password:
-        return jsonify({"error": "username and password required"}), 400
-
-    # Use a single session so the Session-Id cookie from auth/info is
-    # automatically forwarded to the auth proof request — Proton requires it.
-    session = requests.Session()
-    session.headers.update(_login_headers())
-
-    # Step 1: get SRP challenge
-    try:
-        r1 = session.post(
-            f"{PROTON_AUTH_BASE}/auth/info",
-            json={"Username": username},
-            timeout=15,
-        )
-    except requests.RequestException as exc:
-        return jsonify({"error": f"Network error: {exc}"}), 502
-
-    if not r1.ok:
-        logger.error("proton-login: /auth/info HTTP %s: %s", r1.status_code, r1.text[:300])
-        return jsonify({"error": f"Auth info request failed (HTTP {r1.status_code})"}), 502
-
-    info = r1.json()
-    version = info.get("Version", 4)
-    # Use the server's canonical username for SRP (may differ from what was entered).
-    srp_username = info.get("Username") or username
-    logger.info("proton-login: SRP version=%s SRPSession=%s entered=%r srp_username=%r",
-                version, info.get("SRPSession", "")[:8], username, srp_username)
-    if version < 3:
-        return jsonify({"error": f"Unsupported SRP version {version}"}), 400
-
-    try:
-        modulus_bytes    = proton_srp.extract_pgp_content(info["Modulus"])
-        salt_bytes       = _b64d(info["Salt"])
-        server_eph_bytes = _b64d(info["ServerEphemeral"])
-    except (KeyError, Exception) as exc:
-        return jsonify({"error": f"Could not parse server challenge: {exc}"}), 502
-
-    logger.info("proton-login: modulus=%d bytes, salt=%d bytes server_eph=%d bytes",
-                len(modulus_bytes), len(salt_bytes), len(server_eph_bytes))
-
-    # Step 2: compute SRP proof using canonical username from server
-    try:
-        M1, A = proton_srp.compute_proof(srp_username, password, salt_bytes, modulus_bytes, server_eph_bytes)
-    except Exception as exc:
-        logger.exception("SRP computation failed")
-        return jsonify({"error": f"SRP error: {exc}"}), 500
-
-    logger.info("proton-login: computed M1=%s A=%s", M1.hex()[:16], A.hex()[:16])
-
-    # Step 3: submit proof (session carries Session-Id cookie from step 1)
-    try:
-        r2 = session.post(
-            f"{PROTON_AUTH_BASE}/auth",
-            json={
-                "Username":        username,
-                "SRPSession":      info["SRPSession"],
-                "ClientEphemeral": base64.b64encode(A).decode(),
-                "ClientProof":     base64.b64encode(M1).decode(),
-            },
-            timeout=15,
-        )
-    except requests.RequestException as exc:
-        return jsonify({"error": f"Network error: {exc}"}), 502
-
-    logger.info("proton-login: /auth response HTTP %s: %s", r2.status_code, r2.text[:200])
-
-    if r2.status_code in (401, 422):
-        msg = r2.json().get("Error", "Invalid username or password")
-        return jsonify({"error": msg}), 401
-    if not r2.ok:
-        return jsonify({"error": f"Authentication failed (HTTP {r2.status_code})"}), 502
-
-    auth = r2.json()
-
-    # Check whether 2FA is required before credentials can be used
-    two_fa = auth.get("2FA", {})
-    if two_fa.get("Enabled", 0):
-        token = base64.b64encode(os.urandom(16)).decode()
-        _pending_2fa[token] = {
-            "uid":           auth["UID"],
-            "access_token":  auth["AccessToken"],
-            "refresh_token": auth.get("RefreshToken", ""),
-            "expires":       time.time() + _PENDING_2FA_TTL,
-        }
-        logger.info("proton-login: 2FA required for %s", username)
-        return jsonify({"needs_2fa": True, "session_token": token})
-
-    # No 2FA — save credentials and trigger cert refresh
-    _save_login_creds(auth)
-    logger.info("proton-login: login successful for %s", username)
-    return jsonify({"message": "Logged in. Certificate refresh triggered."})
-
-
-@app.route("/api/v1/proton/login/2fa", methods=["POST"])
-def proton_login_2fa():
-    """Complete a 2FA-gated login with a TOTP code.
-
-    Body: {"session_token": "...", "totp": "123456"}
-    """
-    import base64
-    # Expire stale sessions
-    now = time.time()
-    for k in [k for k, v in _pending_2fa.items() if now > v.get("expires", 0)]:
-        _pending_2fa.pop(k, None)
-
-    data  = request.get_json(silent=True) or {}
-    token = data.get("session_token", "")
-    totp  = (data.get("totp") or "").strip()
-
-    state = _pending_2fa.pop(token, None)
-    if not state:
-        return jsonify({"error": "Invalid or expired session — please log in again"}), 400
-    if not totp:
-        return jsonify({"error": "totp is required"}), 400
-
-    try:
-        r = requests.post(
-            f"{PROTON_AUTH_BASE}/auth/2fa",
-            json={"TwoFactorCode": totp},
-            headers=_login_headers(uid=state["uid"], token=state["access_token"]),
-            timeout=15,
-        )
-    except requests.RequestException as exc:
-        return jsonify({"error": f"Network error: {exc}"}), 502
-
-    if r.status_code in (401, 422):
-        msg = r.json().get("Error", "Invalid 2FA code")
-        return jsonify({"error": msg}), 401
-    if not r.ok:
-        return jsonify({"error": f"2FA verification failed (HTTP {r.status_code})"}), 502
-
-    # Tokens remain the same after successful 2FA; scope is promoted server-side
-    _save_login_creds(state)
-    logger.info("proton-login: 2FA verified successfully")
-    return jsonify({"message": "2FA verified. Certificate refresh triggered."})
-
-
-def _save_login_creds(auth: dict) -> None:
-    """Write credentials.json from an auth response dict and trigger cert refresh."""
-    creds = {
-        "uid":           auth["uid"] if "uid" in auth else auth["UID"],
-        "access_token":  auth["access_token"] if "access_token" in auth else auth["AccessToken"],
-        "refresh_token": auth.get("refresh_token") or auth.get("RefreshToken", ""),
-        "appversion":    PROTON_APP_VERSION,
-        "user_agent":    PROTON_USER_AGENT,
-    }
-    CREDENTIALS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS_FILE.write_text(json.dumps(creds, indent=2))
-    CREDENTIALS_FILE.chmod(0o600)
-    _cert_refresher.trigger()
 
 
 if __name__ == "__main__":

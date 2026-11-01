@@ -18,13 +18,11 @@ panel UI, without ever needing shell access to the host.
 
 ### Ideas
 
-- **Login form** — Present a ProtonVPN username/password form in the control
-  panel. On submit, POST the credentials to a new backend endpoint
-  (`/api/v1/proton/login` or similar) on the ProtonVPN container, which runs
-  the SRP authentication against `https://vpn-api.proton.me/auth` and writes
-  the resulting UID/tokens to `credentials.json`.  Requires installing
-  `proton-vpn-session` (or implementing SRP auth from scratch) in the Docker
-  image.
+- ~~**Login form**~~ — Not feasible: Proton answers password logins from this
+  client with a CAPTCHA (code 9001) that only Proton's own domains may frame, so
+  the panel can't present it.  Sign-in happens on the host with
+  `protonvpn/scripts/headless_extract_credentials.sh <username>`, which the panel's
+  "How to fix" dialog explains.
 
 - **Credential status indicator** — Show a badge in the control panel
   reflecting the state of `credentials.json`:
@@ -37,5 +35,5 @@ panel UI, without ever needing shell access to the host.
   this state so the UI can surface it without the user having to watch logs.
 
 - **Re-login prompt** — When the status is Warning or Error, show a banner in
-  the control panel prompting the user to log in again (linking to the login
-  form above).
+  the control panel prompting the user to refresh credentials (the "How to fix"
+  dialog shows the host command).
