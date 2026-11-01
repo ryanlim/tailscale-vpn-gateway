@@ -127,6 +127,12 @@ services:
       - IP_SUBNET=${IP_SUBNET}
       - INSTANCE_NAME=${INSTANCE_NAME}
       - RECONNECT_AFTER_HOURS=${NORDVPN_RECONNECT_AFTER_HOURS}
+      # Kill switch: forwarded exit-node traffic may not leave via eth0 (i.e. leak
+      # with the real IP) when no tunnel is up. Destinations in the allow list
+      # (Docker network / LAN) are still reachable. See scripts/killswitch.sh.
+      - KILLSWITCH=${KILLSWITCH:-true}
+      - KILLSWITCH_ALLOW_CIDRS=${KILLSWITCH_ALLOW_CIDRS:-}
+      - KILLSWITCH_ALLOW_CIDRS6=${KILLSWITCH_ALLOW_CIDRS6:-}
     volumes:
       - "/dev/net/tun:/dev/net/tun"
       - "./nordvpn-wg/wireguard:/etc/wireguard"
@@ -177,6 +183,12 @@ services:
       # (plain WireGuard, like the NordVPN backend). Leave empty to use the
       # legacy local-agent cert flow instead.
       - PROTONVPN_WG_PRIVATE_KEY=${PROTONVPN_WG_PRIVATE_KEY:-}
+      # Kill switch: forwarded exit-node traffic may not leave via eth0 (i.e. leak
+      # with the real IP) when no tunnel is up. Destinations in the allow list
+      # (Docker network / LAN) are still reachable. See scripts/killswitch.sh.
+      - KILLSWITCH=${KILLSWITCH:-true}
+      - KILLSWITCH_ALLOW_CIDRS=${KILLSWITCH_ALLOW_CIDRS:-}
+      - KILLSWITCH_ALLOW_CIDRS6=${KILLSWITCH_ALLOW_CIDRS6:-}
     volumes:
       - "/dev/net/tun:/dev/net/tun"
       - "/lib/modules:/lib/modules:ro"

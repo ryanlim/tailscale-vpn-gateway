@@ -19,7 +19,7 @@ RUN apt-get update && \
 
 COPY scripts/ /scripts/
 COPY NordVPN-WebInterface /webapp
-RUN chmod +x /scripts/entrypoint.sh /scripts/iptables_rules.sh /scripts/nordvpn /scripts/extract_key.sh && \
+RUN chmod +x /scripts/entrypoint.sh /scripts/iptables_rules.sh /scripts/nordvpn /scripts/extract_key.sh /scripts/killswitch.sh && \
     ln -s /scripts/nordvpn /usr/local/bin/nordvpn
 
 ENTRYPOINT ["/scripts/entrypoint.sh"]

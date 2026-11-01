@@ -36,6 +36,11 @@ UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-2}
 # Requires sys_module cap + /lib/modules bind-mount (set in compose).
 modprobe ip6table_filter ip6table_nat 2>/dev/null || true
 
+# Kill switch: install BEFORE the tunnel comes up so forwarded exit-node traffic
+# can never leave via eth0 while no tunnel is up (see killswitch.sh).  Fail
+# closed: if it cannot be installed, do not start as a gateway.
+sh /scripts/killswitch.sh add || { echo "ERROR: kill switch could not be installed"; exit 1; }
+
 # Tear down any stale interface from a previous run.
 wg-quick down "$WG_IFACE" 2>/dev/null || true
 

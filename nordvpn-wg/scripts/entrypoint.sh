@@ -54,7 +54,11 @@ has_egress() {
   return 1
 }
 
-env
+# Kill switch: install BEFORE connecting so forwarded exit-node traffic can never
+# leave via eth0 while no tunnel is up (see killswitch.sh).  Fail closed.
+# (This used to be preceded by a bare `env`, which printed NORDVPN_TOKEN into
+# `docker logs`; it was removed.)
+sh /scripts/killswitch.sh add || { echo "ERROR: kill switch could not be installed"; exit 1; }
 
 nohup python3 /webapp/app.py >/tmp/webapp.log 2>&1 &
 

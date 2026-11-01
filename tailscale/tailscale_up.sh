@@ -216,6 +216,11 @@ sync_split_fwd_table() {
   [ "$SPLIT_CONTROL_TRAFFIC" = "true" ] || return 0
   ACTIVE_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
   ip route replace default via "$ACTIVE_GW" dev eth0 table "$SPLIT_FWD_TABLE" 2>/dev/null
+  # Kill-switch fallback: if the route above is ever missing, forwarded traffic
+  # would fall through to main, whose default is the direct gateway when
+  # split-tunnel is on, i.e. a leak with the real IP.  A higher-metric
+  # blackhole keeps this table failing closed.  (Metric 4096 > the real route's 0.)
+  ip route replace blackhole default metric 4096 table "$SPLIT_FWD_TABLE" 2>/dev/null
 }
 
 setup_split_tunnel() {

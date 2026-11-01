@@ -24,6 +24,6 @@ esac\n' > /usr/local/sbin/resolvconf && \
 
 COPY backend /webapp
 COPY scripts /scripts
-RUN chmod +x /scripts/entrypoint.sh
+RUN chmod +x /scripts/entrypoint.sh /scripts/killswitch.sh
 
 ENTRYPOINT ["/scripts/entrypoint.sh"]
